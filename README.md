@@ -44,6 +44,10 @@ Also note that the bubblewrap sandbox is currently **Linux-only** and requires `
 ![Execution conversation + Git](./docs/screenshots/execution-conversation-git.png)
 *Reviewing code changes, commit, and merge inside an execution conversation.*
 
+## Setup
+
+Use `server/.env.example` as a template to create your local `server/.env`. This file is local-only and not committed to Git.
+
 ## Quick Start
 
 ### Prerequisites
@@ -61,17 +65,24 @@ cd ../web && npm install
 
 ### Run
 
+Start the backend:
+
 ```bash
 cd server
 npm run start
 ```
 
-Then open the web client:
+Then start the web client:
 
 ```bash
 cd web
 npm run dev
 ```
+
+Frontend: http://localhost:5300  
+Backend: http://localhost:3200
+
+In development, Vite proxies `/api` to the backend.
 
 For a production build of the frontend:
 
@@ -79,6 +90,8 @@ For a production build of the frontend:
 cd web
 npm run build
 ```
+
+Serve the built `web/dist` assets from your web server and proxy `/api` to the backend.
 
 ## Contributing
 
