@@ -35,6 +35,9 @@ Also note that the bubblewrap sandbox is currently **Linux-only** and requires `
 ![Settings / sandbox / providers](./docs/screenshots/settings-sandbox-providers.png)
 *Project settings, sandbox controls, and provider configuration.*
 
+![Settings / sandbox / providers](./docs/screenshots/settings-sandbox.png)
+*Project settings, sandbox global permissions example.*
+
 ![Project Memory + plan / execute](./docs/screenshots/project-memory-plan-execute.png)
 *Persistent project memory alongside plan and execute workflows.*
 
