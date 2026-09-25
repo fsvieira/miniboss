@@ -30,8 +30,6 @@ Also note that the bubblewrap sandbox is currently **Linux-only** and requires `
 
 ## Screenshots
 
-> Add real images later. For now, these placeholders show the intended screens.
-
 ![Settings / sandbox / providers](./docs/screenshots/settings-sandbox-providers.png)
 *Project settings, sandbox controls, and provider configuration.*
 
