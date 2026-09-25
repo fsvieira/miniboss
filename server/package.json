@@ -1,0 +1,31 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "REST API Server",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "node tests/focusSystem.test.js && node tests/projectOverviewTools.test.js && node tests/conversationDeleteReport.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@tensorflow/tfjs": "^4.22.0",
+    "better-sqlite3": "^11.7.0",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.7",
+    "express": "^5.2.1",
+    "glob": "^13.0.6",
+    "js-tiktoken": "^1.0.21",
+    "openai": "^6.37.0",
+    "socket.io": "^4.8.3",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {
+    "knip": "^6.14.2"
+  }
+}
