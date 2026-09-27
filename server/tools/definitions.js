@@ -42,7 +42,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
       type: "function",
       function: {
         name: "readFile",
-        description: "Read the contents of a file. Returns a structured preview (first ~6000 chars) plus recommended follow-up commands (readFileLines/readFileChunk) when truncated. You MUST provide only relative paths inside the project working directory. Absolute paths and parent-directory traversal (`..`) are forbidden.",
+        description: "Read the contents of a file. Returns a structured result with path, preview, truncated, totalBytes, returnedBytes, totalLines, returnedLines, and nextAction. You MUST provide only relative paths inside the project working directory. Absolute paths and parent-directory traversal (`..`) are forbidden.",
         parameters: {
           type: "object",
           properties: {
@@ -126,7 +126,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
       type: "function",
       function: {
         name: "searchFiles",
-        description: "Find and list file paths in the project workspace using glob patterns. Use this to discover the project structure or locate specific files by extension/name. All results are scoped to the project working directory.",
+        description: "Find and list file paths in the project workspace using glob patterns. Returns a structured result with pattern, files, and totalFiles. Use this to discover the project structure or locate specific files by extension/name. All results are scoped to the project working directory.",
         parameters: {
           type: "object",
           properties: {
@@ -143,7 +143,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
       type: "function",
       function: {
         name: "searchInFiles",
-        description: "Search for a regex pattern inside files. Returns a structured sample of matching lines (capped) with guidance to refine filePattern/regex when truncated. Maximum 200 files scanned per call. All file access is scoped to the project working directory.",
+        description: "Search for a regex pattern inside files. Returns a structured result with pattern, filePattern, matches, truncated, filesSearched, maxFiles, totalMatches, returnedMatches, maxResults, and nextAction. All file access is scoped to the project working directory.",
         parameters: {
           type: "object",
           properties: {
@@ -277,7 +277,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
       type: "function",
       function: {
         name: "readFileChunk",
-        description: "Read a specific chunk of a file with offset and limit. Returns the file content starting from the specified byte offset with the given length limit. The path must remain inside the project working directory.",
+        description: "Read a specific chunk of a file with offset and limit. Returns a structured result with content, offset, limit, truncated, totalBytes, returnedBytes, and nextAction. The path must remain inside the project working directory.",
         parameters: {
           type: "object",
           properties: {
@@ -325,7 +325,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
       type: "function",
       function: {
         name: "readFileLines",
-        description: "Read a specific range of lines from a file by line number (1-based). Shows line numbers. Ideal for reading specific sections of a file when you already know the structure. Returns max 200 lines per call. The path must remain inside the project working directory.",
+        description: "Read a specific range of lines from a file by line number (1-based). Returns a structured result with content, startLine, numLines, truncated, totalLines, returnedLines, and nextAction. Ideal for reading specific sections of a file when you already know the structure. The path must remain inside the project working directory.",
         parameters: {
           type: "object",
           properties: {
@@ -352,7 +352,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
       type: "function",
       function: {
         name: "grepInFile",
-        description: "Search for a regex pattern inside a single file. Returns matching lines with context lines around each match + totalMatches count. Faster and more focused than searchInFiles when you know which file to inspect. The path must remain inside the project working directory.",
+        description: "Search for a regex pattern inside a single file. Returns a structured result with pattern, path, matches, totalMatches, truncated, and nextAction. Faster and more focused than searchInFiles when you know which file to inspect. The path must remain inside the project working directory.",
         parameters: {
           type: "object",
           properties: {

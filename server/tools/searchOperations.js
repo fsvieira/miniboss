@@ -1,7 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const { glob } = require('glob');
-const { buildSearchPreview, MAX_SEARCH_RESULTS } = require('./helpers/previewUtils');
+const {
+  buildSearchPreview,
+  MAX_SEARCH_RESULTS,
+  MAX_FILES
+} = require('./helpers/previewUtils');
 
 async function searchFiles(pattern, workingDir) {
   const files = await glob(pattern, {
@@ -10,11 +14,12 @@ async function searchFiles(pattern, workingDir) {
     nodir: true
   });
 
-  if (files.length === 0) {
-    return 'No files found matching the pattern.';
-  }
-
-  return files.join('\n');
+  return {
+    tool: 'searchFiles',
+    pattern,
+    files,
+    totalFiles: files.length
+  };
 }
 
 async function searchInFiles(pattern, filePattern, workingDir) {
@@ -27,12 +32,11 @@ async function searchInFiles(pattern, filePattern, workingDir) {
     nodir: true
   });
 
-  const formattedMatches = [];
+  const matches = [];
   let filesSearched = 0;
   let totalMatches = 0;
   let truncated = false;
 
-  const MAX_FILES = 200;
   for (const file of files) {
     if (filesSearched >= MAX_FILES) {
       truncated = true;
@@ -49,8 +53,8 @@ async function searchInFiles(pattern, filePattern, workingDir) {
         regex.lastIndex = 0;
         if (regex.test(lines[index])) {
           totalMatches++;
-          formattedMatches.push(`${file}:${index + 1}  ${lines[index].trim()}`);
-          if (formattedMatches.length >= MAX_SEARCH_RESULTS) {
+          matches.push(`${file}:${index + 1}  ${lines[index].trim()}`);
+          if (matches.length >= MAX_SEARCH_RESULTS) {
             truncated = true;
             break;
           }
@@ -62,27 +66,22 @@ async function searchInFiles(pattern, filePattern, workingDir) {
         break;
       }
     } catch (error) {
-      // Skip files that can't be read (binary, permissions, etc.)
       continue;
     }
-  }
-
-  if (formattedMatches.length === 0) {
-    return 'No matches found.';
   }
 
   const payload = buildSearchPreview({
     pattern,
     filePattern,
-    matches: formattedMatches,
+    matches,
     truncated,
     totalMatches,
-    filesScanned: filesSearched,
+    filesSearched,
     limitReached: truncated || filesSearched >= MAX_FILES
   });
 
   if (payload.truncated) {
-    console.log(`[Tool:searchInFiles] Preview truncated for pattern "${pattern}": sampled ${formattedMatches.length} matches across ${filesSearched} files`);
+    console.log(`[Tool:searchInFiles] Preview truncated for pattern "${pattern}": sampled ${matches.length} matches across ${filesSearched} files`);
   }
 
   return payload;
@@ -93,11 +92,27 @@ async function grepInFile(pattern, relativePath, contextLines = 0, workingDir) {
   const fullPath = resolvePath(relativePath, workingDir);
 
   if (!fs.existsSync(fullPath)) {
-    return `File not found: ${relativePath}`;
+    return {
+      tool: 'grepInFile',
+      pattern,
+      path: relativePath,
+      totalMatches: 0,
+      matches: [],
+      truncated: false,
+      nextAction: 'File not found'
+    };
   }
 
   if (!fs.statSync(fullPath).isFile()) {
-    return `Not a file: ${relativePath}`;
+    return {
+      tool: 'grepInFile',
+      pattern,
+      path: relativePath,
+      totalMatches: 0,
+      matches: [],
+      truncated: false,
+      nextAction: 'Target is not a file'
+    };
   }
 
   const regex = new RegExp(pattern, 'gi');
@@ -109,13 +124,11 @@ async function grepInFile(pattern, relativePath, contextLines = 0, workingDir) {
   for (let i = 0; i < lines.length; i++) {
     if (regex.test(lines[i])) {
       totalMatches++;
-      // Reset regex lastIndex after test (needed with 'g' flag)
       regex.lastIndex = 0;
 
       const startCtx = Math.max(0, i - contextLines);
       const endCtx = Math.min(lines.length, i + contextLines + 1);
 
-      // If there's context, show a header
       if (contextLines > 0 && startCtx > 0 && matches.length > 0) {
         matches.push(`   ...`);
       }
@@ -131,11 +144,18 @@ async function grepInFile(pattern, relativePath, contextLines = 0, workingDir) {
     }
   }
 
-  if (totalMatches === 0) {
-    return `No matches found for pattern "${pattern}" in ${relativePath}.`;
-  }
-
-  return `totalMatches: ${totalMatches}\n` + matches.join('\n');
+  return {
+    tool: 'grepInFile',
+    pattern,
+    path: relativePath,
+    totalMatches,
+    matches,
+    truncated: false,
+    nextAction:
+      totalMatches === 0
+        ? 'Broaden the regex or inspect the file with readFile/readFileLines'
+        : 'Inspect specific matches or use readFileLines to read surrounding context'
+  };
 }
 
 module.exports = {

@@ -1,7 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const { resolvePath } = require('./utilityOperations');
-const { buildFilePreview } = require('./helpers/previewUtils');
+const {
+  buildFilePreview,
+  normalizeReadFileChunkResult,
+  normalizeReadFileLinesResult
+} = require('./helpers/previewUtils');
 
 async function readFile(relativePath, workingDir) {
   const fullPath = resolvePath(relativePath, workingDir);
@@ -39,7 +43,14 @@ async function readFileChunk(relativePath, offset = 0, limit = 20000, workingDir
   const fileSize = stats.size;
 
   if (offset >= fileSize) {
-    return 'Offset is beyond file size. File is empty or offset is too large.';
+    return normalizeReadFileChunkResult({
+      relativePath,
+      content: '',
+      offset,
+      limit,
+      returnedBytes: 0,
+      totalBytes: fileSize
+    });
   }
 
   const actualLimit = Math.min(limit, fileSize - offset);
@@ -50,7 +61,14 @@ async function readFileChunk(relativePath, offset = 0, limit = 20000, workingDir
 
   const content = buffer.toString('utf-8', 0, bytesRead);
 
-  return content;
+  return normalizeReadFileChunkResult({
+    relativePath,
+    content,
+    offset,
+    limit: actualLimit,
+    returnedBytes: bytesRead,
+    totalBytes: fileSize
+  });
 }
 
 async function writeFile(relativePath, content, workingDir) {
@@ -195,23 +213,31 @@ async function readFileLines(relativePath, startLine = 1, numLines = 50, working
   const endIndex = Math.min(totalLines, startIndex + numLines);
 
   if (startIndex >= totalLines) {
-    return `Start line ${startLine} exceeds file length (${totalLines} lines).`;
+    return normalizeReadFileLinesResult({
+      relativePath,
+      content: '',
+      startLine,
+      numLines,
+      returnedLines: 0,
+      totalLines
+    });
   }
 
   const selectedLines = lines.slice(startIndex, endIndex);
-  let result = `File: ${relativePath} (${totalLines} lines total)\n`;
-  result += `Showing lines ${startIndex + 1}-${endIndex}:\n\n`;
-
-  result += selectedLines.map((line, i) => {
+  const renderedLines = selectedLines.map((line, i) => {
     const lineNum = startIndex + i + 1;
     return `${String(lineNum).padStart(6, ' ')} | ${line}`;
-  }).join('\n');
+  });
+  const rendered = `File: ${relativePath} (${totalLines} lines total)\nShowing lines ${startIndex + 1}-${endIndex}:\n\n` + renderedLines.join('\n');
 
-  if (endIndex < totalLines) {
-    result += `\n\n[... ${totalLines - endIndex} more lines. Use readFileLines with startLine=${endIndex + 1} to continue ...]`;
-  }
-
-  return result;
+  return normalizeReadFileLinesResult({
+    relativePath,
+    content: rendered,
+    startLine,
+    numLines,
+    returnedLines: selectedLines.length,
+    totalLines
+  });
 }
 
 module.exports = {
