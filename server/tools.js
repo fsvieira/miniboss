@@ -94,6 +94,14 @@ async function executeTool(toolName, args, workingDir, context = {}, conversatio
         result = await semanticSearch(args.query, args.maxResults || 5, context.conversationId);
         break;
 
+      case 'listSandboxAccess': {
+        const { DatabaseAPI, DatabaseConnection } = require('./services/db');
+        const connection = new DatabaseConnection();
+        const dbApi = new DatabaseAPI(connection);
+        result = dbApi.getAllSandboxPaths();
+        break;
+      }
+
       case 'runCommand':
         // This will be handled specially in aiController with user validation
         result = { requiresApproval: true, command: args.command, cwd: workingDir, timeout: args.timeout || 0 };

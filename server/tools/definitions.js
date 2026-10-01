@@ -4,7 +4,8 @@
 const READ_ONLY_TOOLS = [
   'readFile', 'readFileChunk', 'readFileLines', 'readMultipleFiles',
   'listDirectory', 'getFileTree', 'searchFiles', 'searchInFiles',
-  'grepInFile', 'semanticSearch', 'getFileInfo', 'copyFile'
+  'grepInFile', 'semanticSearch', 'getFileInfo', 'copyFile',
+  'listSandboxAccess'
 ];
 
 /**
@@ -371,6 +372,18 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
             }
           },
           required: ["pattern", "path"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "listSandboxAccess",
+        description: "List the current sandbox access configuration for this worktree. Returns the authorized extra paths and their access modes from the sandbox path store. Use this to check what external paths the AI can access instead of assuming fixed locations.",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: []
         }
       }
     },
