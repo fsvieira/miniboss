@@ -514,16 +514,23 @@ export default function ConversationSettingsPanel({
               Zona de Perigo
             </Typography>
 
-            <Button
-              onClick={handleDeleteConversation}
-              variant="outlined"
-              color="error"
-              startIcon={<Delete />}
-              disabled={loading}
-              fullWidth
-            >
-              Apagar Conversa
-            </Button>
+            {conversation?.conversation_type !== 'project' && (
+              <Button
+                onClick={handleDeleteConversation}
+                variant="outlined"
+                color="error"
+                startIcon={<Delete />}
+                disabled={loading}
+                fullWidth
+              >
+                Apagar Conversa
+              </Button>
+            )}
+            {conversation?.conversation_type === 'project' && (
+              <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center' }}>
+                Project Memory cannot be deleted here.
+              </Typography>
+            )}
           </Box>
         )}
 

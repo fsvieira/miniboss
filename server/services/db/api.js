@@ -214,12 +214,15 @@ class DatabaseAPI {
    */
   getConversation(id) {
     const stmt = this.connection.prepare(`
-      SELECT id, project_id, title, created_at, updated_at, last_summarized_at,
-             provider_id, model, repo_root, worktree_path, git_branch, base_branch,
-             ai_touched_files, parent_id, conversation_type, focus_goal, focus_report,
-              active_focus_id, processing_state, phase, max_iterations, last_sent_ai_msg_id, thinking_mode, plan, mode
-      FROM conversations
-      WHERE id = ?
+      SELECT c.id, c.project_id, c.title, c.created_at, c.updated_at, c.last_summarized_at,
+             c.provider_id, c.model, c.repo_root, c.worktree_path, c.git_branch, c.base_branch,
+             c.ai_touched_files, c.parent_id, c.conversation_type, c.focus_goal, c.focus_report,
+             c.active_focus_id, c.processing_state, c.phase, c.max_iterations, c.last_sent_ai_msg_id,
+             c.thinking_mode, c.plan, c.mode,
+             p.name AS project_name
+      FROM conversations c
+      LEFT JOIN projects p ON p.id = c.project_id
+      WHERE c.id = ?
     `);
 
     return stmt.get(id) || null;
