@@ -119,6 +119,15 @@ class ToolProcessor {
       conversationId,
     };
 
+    // Plan mode enforcement: block write-capable tools at the processor level so even
+    // if a tool call slips through definitions filtering, the worktree stays read-only.
+    const writeTools = new Set([
+      'writeFile', 'editFile', 'moveFile', 'deleteFile', 'createDirectory', 'copyFile', 'runCommand'
+    ]);
+    if (conv?.mode === 'plan' && writeTools.has(toolName)) {
+      throw new Error(`Tool '${toolName}' is disabled in plan mode.`);
+    }
+
     let result;
 
     // Special tools with their own async flow
@@ -204,7 +213,7 @@ class ToolProcessor {
       enabled: true,
       repoRoot,
       worktreePath: worktreePath || repoRoot,
-      readOnlyWorktree: conv && ['focus', 'subbot', 'project'].includes(conv.conversation_type),
+      readOnlyWorktree: conv && ['focus', 'subbot', 'project'].includes(conv.conversation_type) || conv?.mode === 'plan',
       extraPaths: this._getSandboxExtraPaths()
     };
 

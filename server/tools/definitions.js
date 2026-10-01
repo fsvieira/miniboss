@@ -445,20 +445,22 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
     const { createTaskTreeTools } = require('./taskTreeTools');
     const taskTools = createTaskTreeTools(conversationId);
 
-    // MAIN conversations get ALL tools + investigate + TODO/task tree tools + plan tools
-    // In 'plan' mode (read-only): only read + todo + plan + investigate tools are exposed
-    if (conversationType === 'main') {
-      const isPlanMode = conversationMode === 'plan';
-      if (isPlanMode) {
-        const writeTools = [
-          'writeFile', 'editFile', 'moveFile', 'deleteFile', 'createDirectory', 'copyFile', 'runCommand'
-        ];
-        for (let i = tools.length - 1; i >= 0; i--) {
-          if (writeTools.includes(tools[i].function.name)) {
-            tools.splice(i, 1);
-          }
+    // Enforce plan mode read-only filtering for ALL conversation types that support mode switching.
+    // This removes write tools and runCommand from the exposed tool list when conversationMode === 'plan'.
+    const isPlanMode = conversationMode === 'plan';
+    if (isPlanMode) {
+      const writeTools = [
+        'writeFile', 'editFile', 'moveFile', 'deleteFile', 'createDirectory', 'copyFile', 'runCommand'
+      ];
+      for (let i = tools.length - 1; i >= 0; i--) {
+        if (writeTools.includes(tools[i].function.name)) {
+          tools.splice(i, 1);
         }
       }
+    }
+
+    // MAIN conversations get ALL tools + investigate + TODO/task tree tools + plan tools
+    if (conversationType === 'main') {
       const { createPlanTools } = require('./planTools');
       const planTools = createPlanTools(conversationId);
       for (const name of ['updatePlan', 'getPlan']) {
