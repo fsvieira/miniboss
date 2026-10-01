@@ -347,36 +347,43 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
               />
             </Box>
           ) : (
-            <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-              {conversation?.title || 'Select a conversation'}
-              {isProjectMemory && (
-                <Chip label="Project Memory" size="small" color="secondary" variant="outlined" sx={{ fontSize: '0.65rem', height: 20 }} />
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+              <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                {conversation?.title || 'Select a conversation'}
+                {isProjectMemory && (
+                  <Chip label="Project Memory" size="small" color="secondary" variant="outlined" sx={{ fontSize: '0.65rem', height: 20 }} />
+                )}
+                {isProjectMemory && (
+                  <Chip
+                    icon={<Lock fontSize="small" />}
+                    label="Read Only"
+                    size="small"
+                    color="warning"
+                    variant="outlined"
+                    sx={{ fontSize: '0.65rem', height: 20 }}
+                  />
+                )}
+                {conversation?.conversation_type === 'main' && (
+                  <Chip label="MAIN" size="small" color="primary" variant="outlined" sx={{ fontSize: '0.65rem', height: 20 }} />
+                )}
+                {conversation?.conversation_type === 'main' && (
+                  <Chip
+                    label={conversation?.mode === 'exec' ? 'Exec Mode' : 'Plan Mode'}
+                    size="small"
+                    color={conversation?.mode === 'exec' ? 'success' : 'secondary'}
+                    variant="outlined"
+                    onClick={handleToggleMode}
+                    clickable
+                    sx={{ fontSize: '0.65rem', height: 20, cursor: 'pointer' }}
+                  />
+                )}
+              </h3>
+              {conversation?.project_name && (
+                <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.2 }}>
+                  {conversation.project_name}
+                </Typography>
               )}
-              {isProjectMemory && (
-                <Chip
-                  icon={<Lock fontSize="small" />}
-                  label="Read Only"
-                  size="small"
-                  color="warning"
-                  variant="outlined"
-                  sx={{ fontSize: '0.65rem', height: 20 }}
-                />
-              )}
-              {conversation?.conversation_type === 'main' && (
-                <Chip label="MAIN" size="small" color="primary" variant="outlined" sx={{ fontSize: '0.65rem', height: 20 }} />
-              )}
-              {conversation?.conversation_type === 'main' && (
-                <Chip
-                  label={conversation?.mode === 'exec' ? 'Exec Mode' : 'Plan Mode'}
-                  size="small"
-                  color={conversation?.mode === 'exec' ? 'success' : 'secondary'}
-                  variant="outlined"
-                  onClick={handleToggleMode}
-                  clickable
-                  sx={{ fontSize: '0.65rem', height: 20, cursor: 'pointer' }}
-                />
-              )}
-            </h3>
+            </Box>
           )}
         </Box>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
