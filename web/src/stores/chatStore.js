@@ -14,7 +14,6 @@ function createConversationState() {
     hasLoaded: false,
     isLoadingConversation: false,
     hasUnread: false,
-    hasPendingApproval: false,
   });
 }
 
@@ -40,7 +39,6 @@ class ChatStore {
     hasLoaded: false,
     isLoadingConversation: false,
     hasUnread: false,
-    hasPendingApproval: false,
   };
 
   constructor() {
@@ -57,9 +55,6 @@ class ChatStore {
     socketService.on('message', this.handleIncomingMessage);
     socketService.on('ai-status', this.handleAiStatus);
     socketService.on('context_info', this.handleContextInfo);
-    socketService.on('command_approval_required', this.handleCommandApprovalRequired);
-    socketService.on('approval_handled', this.handleApprovalHandled);
-    socketService.on('approval_expired', this.handleApprovalExpired);
     socketService.on('focus_started', this.handleFocusStarted);
     socketService.on('focus_report', this.handleFocusReport);
     socketService.on('focus_status_change', this.handleFocusStatusChange);
@@ -108,24 +103,6 @@ class ChatStore {
     return ids;
   }
 
-  get pendingApprovalConversationIds() {
-    const ids = new Set();
-
-    for (const [conversationId, state] of this.conversationStates.entries()) {
-      if (state.hasPendingApproval) {
-        ids.add(conversationId);
-      }
-    }
-
-    return ids;
-  }
-
-  /**
-   * Estado autoritativo (Fase E) por conversa, para a sidebar.
-   * Only includes conversations with status already received from the server;
-   * otherwise the sidebar uses the status from the initial payload (conv.status).
-   * @returns {Object} Map conversationId -> 'running'|'waiting'|'completed'|'error'
-   */
   get conversationStatusById() {
     const map = {};
     for (const [conversationId, state] of this.conversationStates.entries()) {
@@ -181,41 +158,13 @@ class ChatStore {
     const { messages, contextInfo } = await conversationService.loadMessages(conversationId);
 
     runInAction(() => {
-      const approvalMessages = messages.filter((message) => message.role === 'approval_request');
-      const visibleMessages = messages.filter((message) => message.role !== 'approval_request');
-      const approvalToolIndicators = approvalMessages.map((message, index) => {
-        let parsedArgs = {};
-        try {
-          parsedArgs = typeof message.tool_args === 'string'
-            ? JSON.parse(message.tool_args)
-            : (message.tool_args || {});
-        } catch {
-          parsedArgs = {};
-        }
-
-        return {
-          id: `pending_tool_${message.tool_call_id || index}`,
-          name: message.tool_name || 'runCommand',
-          args: parsedArgs,
-          result: 'Waiting for approval...',
-          approvalPending: true,
-          toolCallId: message.tool_call_id,
-          conversationId,
-          command: parsedArgs.command,
-          cwd: parsedArgs.cwd,
-          parsedCommand: parsedArgs._parsedCommand || null,
-          autoApprovalRuleCount: parsedArgs._autoApprovalRuleCount || 0,
-        };
-      });
-
-      state.messages = visibleMessages;
+      state.messages = messages;
       state.contextInfo = contextInfo;
-      state.toolIndicators = approvalToolIndicators;
+      state.toolIndicators = [];
       state.hasLoaded = true;
       state.isLoadingConversation = false;
       // Mark as read when the user opens the conversation
       state.hasUnread = false;
-      state.hasPendingApproval = approvalMessages.length > 0;
     });
   }
 
@@ -425,121 +374,6 @@ class ChatStore {
       } else {
         state.aiStatus = 'idle';
         state.isLoading = false;
-      }
-    });
-  };
-
-  handleApprovalHandled = (data) => {
-    console.log('[DEBUG] handleApprovalHandled received', data);
-    const conversationId = data?.conversationId;
-    if (!conversationId) return;
-
-    const state = this.ensureConversationState(conversationId);
-    runInAction(() => {
-      // Update or remove tool indicator
-      const idx = state.toolIndicators.findIndex(t => t.toolCallId === data.tool_call_id);
-      if (idx !== -1) {
-        state.toolIndicators[idx].approvalPending = false;
-        state.toolIndicators[idx].result = data.approved ? 'Approved' : 'Denied';
-        setTimeout(() => {
-          runInAction(() => {
-            state.toolIndicators = state.toolIndicators.filter(t => t.toolCallId !== data.tool_call_id);
-          });
-        }, 800);
-      }
-
-      const before = state.messages.length;
-      state.messages = state.messages.filter(m =>
-        !(m.role === 'approval_request' && m.tool_call_id === data.tool_call_id)
-      );
-      state.hasPendingApproval = state.messages.some((m) => m.role === 'approval_request');
-      console.log('[DEBUG] handleApprovalHandled filtered messages', { before, after: state.messages.length });
-    });
-  };
-
-  handleApprovalExpired = (data) => {
-    const conversationId = data?.conversationId;
-    if (!conversationId) return;
-
-    const state = this.ensureConversationState(conversationId);
-    runInAction(() => {
-      state.toolIndicators = state.toolIndicators.filter((tool) => tool.toolCallId !== data.tool_call_id);
-      state.messages = state.messages.filter((message) =>
-        !(message.role === 'approval_request' && message.tool_call_id === data.tool_call_id)
-      );
-      state.hasPendingApproval = state.messages.some((message) => message.role === 'approval_request');
-    });
-  };
-
-  handleCommandApprovalRequired = (data) => {
-    const conversationId = data?.conversationId;
-    if (!conversationId) {
-      return;
-    }
-
-    const state = this.ensureConversationState(conversationId);
-    runInAction(() => {
-      const existingIndex = state.messages.findIndex((message) =>
-        message.role === 'approval_request' && message.tool_call_id === data.toolCallId
-      );
-      const approvalMessage = {
-        id: `pending_approval_${data.toolCallId}`,
-        conversation_id: conversationId,
-        role: 'approval_request',
-        content: '',
-        tool_call_id: data.toolCallId,
-        tool_name: 'runCommand',
-        tool_args: JSON.stringify({
-          command: data.command,
-          cwd: data.cwd,
-          _parsedCommand: data.parsedCommand,
-          _autoApprovalRuleCount: data.autoApprovalRuleCount || 0
-        }),
-        expires_at: data.expiresAt,
-        created_at: new Date().toISOString()
-      };
-
-      if (existingIndex >= 0) {
-        state.messages[existingIndex] = { ...state.messages[existingIndex], ...approvalMessage };
-      } else {
-        state.messages.push(approvalMessage);
-        state.messages.sort((a, b) => {
-          const ta = new Date(a.created_at || 0).getTime();
-          const tb = new Date(b.created_at || 0).getTime();
-          if (ta !== tb) return ta - tb;
-          return String(a.id || '').localeCompare(String(b.id || ''));
-        });
-      }
-
-      const toolIndicator = state.toolIndicators.find((tool) => tool.toolCallId === data.toolCallId);
-      if (toolIndicator) {
-        toolIndicator.approvalPending = true;
-        toolIndicator.result = 'Waiting for approval...';
-        toolIndicator.command = data.command;
-        toolIndicator.cwd = data.cwd;
-        toolIndicator.parsedCommand = data.parsedCommand || null;
-        toolIndicator.autoApprovalRuleCount = data.autoApprovalRuleCount || 0;
-      } else {
-        state.toolIndicators.push({
-          id: data.toolCallId,
-          name: 'runCommand',
-          args: JSON.stringify({ command: data.command }),
-          result: 'Waiting for approval...',
-          approvalPending: true,
-          toolCallId: data.toolCallId,
-          conversationId,
-          command: data.command,
-          cwd: data.cwd,
-          parsedCommand: data.parsedCommand || null,
-          autoApprovalRuleCount: data.autoApprovalRuleCount || 0,
-          sourceFocusId: data.sourceFocusId || null,
-          sourceFocusTitle: data.sourceFocusTitle || null,
-        });
-      }
-
-      state.hasPendingApproval = true;
-      if (conversationId !== this.activeConversationId) {
-        state.hasUnread = true;
       }
     });
   };
@@ -804,26 +638,25 @@ class ChatStore {
             state.contextInfo = data;
           });
         },
-        onToolStart: (toolName, args, approvalPending, toolCallId) => {
+        onToolStart: (toolName, args, toolCallId) => {
           if (!isActiveToken()) {
             return;
           }
 
-          console.log('Adding tool indicator', { toolName, approvalPending, toolCallId, conversationId });
+          console.log('Adding tool indicator', { toolName, toolCallId, conversationId });
            runInAction(() => {
              const id = `tool_${Date.now()}_${state.toolIndicators.length}`;
              state.toolIndicators.push({
                id,
                name: toolName,
                args,
-               result: approvalPending ? 'Waiting for approval...' : 'Running...',
-               approvalPending,
+               result: 'Running...',
                toolCallId,
                conversationId
              });
            });
 
-          callbacks.onToolStart?.(toolName, args, approvalPending, toolCallId);
+          callbacks.onToolStart?.(toolName, args, toolCallId);
         },
         onToolEnd: (toolName, result) => {
           if (!isActiveToken()) {
@@ -833,7 +666,7 @@ class ChatStore {
           runInAction(() => {
             const lastTool = [...state.toolIndicators]
               .reverse()
-              .find((tool) => tool.name === toolName && (tool.result === 'Running...' || tool.result === 'Waiting for approval...'));
+              .find((tool) => tool.name === toolName && tool.result === 'Running...');
 
             if (lastTool) {
               lastTool.result = result;
@@ -870,9 +703,9 @@ class ChatStore {
             // Tool indicators are only for in-flight UI feedback during streaming.
 
             // Safety net: descartar indicators já terminados que tenham ficado por limpar
-            // (ex: broadcast perdido). Mantemos apenas os de aprovação pendente,
-            // consistente com loadConversation.
-            state.toolIndicators = state.toolIndicators.filter((t) => t.approvalPending);
+            // (ex: broadcast perdido). Os tool indicators são só feedback in-flight;
+            // as mensagens reais chegan via socket (message role='tool').
+            state.toolIndicators = [];
 
             // Create a message from finish events (content_filter, empty_content, etc.)
             const finishMessage = finishData?.content || '';
@@ -902,7 +735,7 @@ class ChatStore {
 
             // Safety net idêntico ao de onFinish: nunca deixar indicators de tools
             // já terminadas na base da lista de mensagens.
-            state.toolIndicators = state.toolIndicators.filter((t) => t.approvalPending);
+            state.toolIndicators = [];
           });
 
           callbacks.onDone?.();
@@ -933,26 +766,6 @@ class ChatStore {
           });
 
           callbacks.onError?.(error);
-        },
-        onCommandApprovalRequired: (data) => {
-          if (!isActiveToken()) {
-            return;
-          }
-
-          runInAction(() => {
-            // Find the tool indicator and set approval pending
-            const toolIndicator = state.toolIndicators.find(t => t.toolCallId === data.toolCallId);
-            if (toolIndicator) {
-              toolIndicator.approvalPending = true;
-              toolIndicator.result = 'Waiting for approval...';
-              toolIndicator.command = data.command;
-              toolIndicator.cwd = data.cwd;
-            } else {
-              console.warn('Tool indicator not found for approval', data.toolCallId);
-            }
-          });
-
-          callbacks.onCommandApprovalRequired?.(data);
         }
       });
     } catch (error) {
@@ -975,40 +788,6 @@ class ChatStore {
     const state = this.ensureConversationState(conversationId);
     runInAction(() => {
       state.toolIndicators = [];
-      // Also clear any pending approval request messages
-      state.messages = state.messages.filter(m => m.role !== 'approval_request');
-      state.hasPendingApproval = false;
-    });
-  }
-
-  removeApprovalMessage(conversationId, toolCallId) {
-    console.log('[DEBUG] removeApprovalMessage called', { conversationId, toolCallId });
-    if (!toolCallId) return;
-
-    runInAction(() => {
-      // If we have a valid conversationId, use it directly
-      if (conversationId) {
-        const state = this.ensureConversationState(conversationId);
-        state.messages = state.messages.filter(m =>
-          !(m.role === 'approval_request' && m.tool_call_id === toolCallId)
-        );
-        state.toolIndicators = state.toolIndicators.filter(t => t.toolCallId !== toolCallId);
-        state.hasPendingApproval = state.messages.some((m) => m.role === 'approval_request');
-        return;
-      }
-
-      // Fallback: search all loaded conversation states (handles undefined conversationId case)
-      for (const [id, state] of this.conversationStates.entries()) {
-        const before = state.toolIndicators.length;
-        state.toolIndicators = state.toolIndicators.filter(t => t.toolCallId !== toolCallId);
-        state.messages = state.messages.filter(m =>
-          !(m.role === 'approval_request' && m.tool_call_id === toolCallId)
-        );
-        state.hasPendingApproval = state.messages.some((m) => m.role === 'approval_request');
-        if (state.toolIndicators.length !== before) {
-          console.log('[DEBUG] removeApprovalMessage fallback removed from conversation', id);
-        }
-      }
     });
   }
 

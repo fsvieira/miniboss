@@ -19,43 +19,7 @@ const { AiClient } = require('../services/ai');
 class AIController {
     constructor() {
       this.activeOperations = new Map();
-      this.pendingApprovals = new Map();
-      this.pendingApprovalHandlers = new Map();
-      this.approvalTimeoutMs = 600000; // 10 minutes timeout (auto-deny)
     }
-
-  /**
-   * Handle a command approval response from the WebSocket.
-   * Resolves the pending promise so the loop can continue.
-   */
-   handleCommandApproval(toolCallId, approved, meta = {}) {
-     // New flow: resolve handler
-     const handler = this.pendingApprovalHandlers.get(toolCallId);
-     if (handler) {
-       handler({ approved, ...meta });
-       this.pendingApprovalHandlers.delete(toolCallId);
-       return true;
-     }
-     // Legacy
-     const pending = this.pendingApprovals.get(toolCallId);
-     if (!pending) {
-       console.log(`[AI] No pending approval for toolCallId=${toolCallId}`);
-       return false;
-     }
-     clearTimeout(pending.timeout);
-     pending.resolve({ approved, ...meta });
-     this.pendingApprovals.delete(toolCallId);
-     return true;
-   }
-
-   async requestApproval(toolCallId, approvalData) {
-     // approvalData already created in DB by caller if needed
-     return new Promise((resolve) => {
-       this.pendingApprovalHandlers.set(toolCallId, (resolution) => {
-         resolve(resolution);
-       });
-     });
-   }
 
   setConversationStatus(conversationId, status) {
     if (!conversationId) {
@@ -225,17 +189,6 @@ class AIController {
         }
       } catch (_) {}
 
-      // 4. Clean up any pending approval handlers for this conversation
-      for (const [toolCallId, handler] of this.pendingApprovalHandlers) {
-        try {
-          const pending = db.getPendingApprovalByToolCallId(toolCallId);
-          if (pending && pending.conversation_id == conversationId) {
-            handler({ approved: false, reason: 'cancelled' });
-            this.pendingApprovalHandlers.delete(toolCallId);
-          }
-        } catch (_) {}
-      }
-
       return true;
     } catch (error) {
       console.error('[AI Controller] Error during cancelOperation:', error);
@@ -269,18 +222,6 @@ class AIController {
 
   cleanupConversation(conversationId) {
     this._cancelSingleOperation(conversationId, 'cleanup');
-
-    for (const [toolCallId, handler] of this.pendingApprovalHandlers) {
-      this.pendingApprovalHandlers.delete(toolCallId);
-    }
-
-    for (const [toolCallId, pending] of this.pendingApprovals) {
-      if (pending.conversationId == conversationId) {
-        clearTimeout(pending.timeout);
-        this.pendingApprovals.delete(toolCallId);
-      }
-    }
-
     this.activeOperations.delete(conversationId);
   }
 

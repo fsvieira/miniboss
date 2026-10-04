@@ -1,17 +1,9 @@
 const serviceRegistry = require('./serviceFactory');
-const {
-  buildRuleFromTemplate,
-  hashRule,
-  parseSimpleCommand,
-  resolvePathToken,
-  validateTemplate
-} = require('./commandApprovalService');
 
 class SocketService {
   constructor() {
     this.io = null;
     this.aiController = null;
-    this.approvalSweepTimer = null;
   }
 
   initialize(io) {
@@ -21,44 +13,6 @@ class SocketService {
 
   setAIController(controller) {
     this.aiController = controller;
-    this.startApprovalExpirySweep();
-  }
-
-  startApprovalExpirySweep() {
-    if (this.approvalSweepTimer) {
-      return;
-    }
-
-    this.approvalSweepTimer = setInterval(() => {
-      try {
-        const db = serviceRegistry.getDatabaseAPI();
-        const expiredApprovals = db.expirePendingApprovals();
-
-        expiredApprovals.forEach((approval) => {
-          this.aiController?.handleCommandApproval(approval.tool_call_id, false, { reason: 'expired' });
-          this.broadcastToConversation(approval.conversation_id, 'approval_expired', {
-            conversationId: approval.conversation_id,
-            tool_call_id: approval.tool_call_id,
-            toolCallId: approval.tool_call_id,
-            expiresAt: approval.expires_at
-          });
-
-          const toolProcessor = serviceRegistry.getToolProcessor();
-          if (toolProcessor) {
-            toolProcessor.resolveCommandApproval(approval.tool_call_id, false);
-          }
-        });
-      } catch (error) {
-        console.error('[SOCKET] Failed to expire pending approvals', error);
-      }
-    }, 5000);
-  }
-
-  stopApprovalExpirySweep() {
-    if (this.approvalSweepTimer) {
-      clearInterval(this.approvalSweepTimer);
-      this.approvalSweepTimer = null;
-    }
   }
 
   setupConnectionHandlers() {
@@ -150,116 +104,6 @@ class SocketService {
         console.log(`Socket ${socket.id} left conversation ${conversationId}`);
       });
 
-      // Handle command approval responses from the user
-      socket.on('command_approval_response', (data) => {
-        const { toolCallId, approved, conversationId } = data;
-        console.log(`[SOCKET] Command approval response: toolCallId=${toolCallId}, approved=${approved}, conversationId=${conversationId}`);
-        if (this.aiController) {
-          try {
-            const db = serviceRegistry.getDatabaseAPI();
-            const pending = db.getPendingApprovalByToolCallId(toolCallId);
-            if (!pending || pending.closed_at) {
-              return;
-            }
-
-            db.closePendingApprovalByToolCallId(toolCallId, approved ? 'approved' : 'denied');
-            this.aiController.handleCommandApproval(toolCallId, approved, {
-              reason: approved ? 'approved' : 'denied'
-            });
-            this.broadcastToConversation(pending.conversation_id, 'approval_handled', {
-              tool_call_id: toolCallId,
-              toolCallId,
-              approved,
-              conversationId: pending.conversation_id,
-              closeReason: approved ? 'approved' : 'denied'
-            });
-
-            // NOVO: Resolver a tool no ToolProcessor
-            const toolProcessor = serviceRegistry.getToolProcessor();
-            if (toolProcessor) {
-              toolProcessor.resolveCommandApproval(toolCallId, approved);
-            }
-          } catch (e) { console.error('Failed to clean pending approval', e); }
-        } else {
-          console.error(`[SOCKET] No AI controller available for approval`);
-        }
-      });
-
-      socket.on('command_auto_approve', (data) => {
-        const { toolCallId, conversationId, template } = data || {};
-        if (!toolCallId) {
-          return;
-        }
-
-        try {
-          const db = serviceRegistry.getDatabaseAPI();
-          const pending = db.getPendingApprovalByToolCallId(toolCallId);
-          if (!pending || pending.closed_at) {
-            return;
-          }
-
-          const conversation = db.getConversationWithProject(pending.conversation_id);
-          if (!conversation?.worktree_path) {
-            socket.emit('error', { message: 'Conversation worktree not available for auto-approval.' });
-            return;
-          }
-
-          const parsedCommand = parseSimpleCommand(
-            pending.command,
-            pending.cwd || conversation.worktree_path,
-            conversation.worktree_path
-          );
-          const validation = validateTemplate(parsedCommand, template);
-          if (!validation.ok) {
-            socket.emit('error', { message: `Invalid auto-approval template: ${validation.reason}` });
-            return;
-          }
-
-          const cwdValidation = resolvePathToken('.', parsedCommand.cwd, conversation.worktree_path);
-          if (!cwdValidation.ok) {
-            socket.emit('error', { message: 'Auto-approve only supports working directories inside the worktree.' });
-            return;
-          }
-
-          for (const selectedPart of template.parts || []) {
-            if (selectedPart.mode !== 'path') {
-              continue;
-            }
-            const parsedPart = parsedCommand.parts.find((part) => part.index === selectedPart.index);
-            const pathValidation = resolvePathToken(parsedPart?.value, parsedCommand.cwd, conversation.worktree_path);
-            if (!pathValidation.ok) {
-              socket.emit('error', { message: `Path token "${parsedPart?.value || ''}" is outside the worktree.` });
-              return;
-            }
-          }
-
-          const rule = buildRuleFromTemplate(parsedCommand, template);
-          const savedRule = db.createAutoApprovalRule({
-            command_name: parsedCommand.executable,
-            rule_hash: hashRule(rule),
-            rule_json: JSON.stringify(rule)
-          });
-
-          db.closePendingApprovalByToolCallId(toolCallId, 'auto_approved');
-          this.aiController?.handleCommandApproval(toolCallId, true, {
-            reason: 'auto_approved',
-            autoApprovalRuleId: savedRule.id
-          });
-
-          this.broadcastToConversation(pending.conversation_id, 'approval_handled', {
-            tool_call_id: toolCallId,
-            toolCallId,
-            approved: true,
-            conversationId: pending.conversation_id,
-            closeReason: 'auto_approved',
-            autoApprovalRuleId: savedRule.id
-          });
-        } catch (error) {
-          console.error('[SOCKET] Failed to auto-approve command', error);
-          socket.emit('error', { message: `Failed to auto-approve command: ${error.message}` });
-        }
-      });
-
       // Handle AI chat messages via WebSocket
       socket.on('send_message', async (data) => {
         console.log('══════════════════════════════════════════════════════════');
@@ -342,12 +186,11 @@ class SocketService {
   }
 
   // Streaming AI events
-  broadcastToolStart(conversationId, toolName, args, approvalPending, toolCallId) {
+  broadcastToolStart(conversationId, toolName, args, toolCallId) {
     this.broadcastToConversation(conversationId, 'tool_start', {
       conversationId,
       tool: toolName,
       args: args,
-      approval_pending: approvalPending,
       tool_call_id: toolCallId
     });
   }
@@ -364,13 +207,6 @@ class SocketService {
     this.broadcastToConversation(conversationId, 'text', {
       conversationId,
       content: content
-    });
-  }
-
-  broadcastCommandApprovalRequired(conversationId, data) {
-    this.broadcastToConversation(conversationId, 'command_approval_required', {
-      conversationId,
-      ...data
     });
   }
 

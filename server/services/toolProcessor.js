@@ -5,7 +5,6 @@ const { executeTool } = require('../tools');
 const { runShellCommand } = require('./shellExecutor');
 const { safeSerializeToolResult } = require('../controllers/toolUtils');
 const { createTaskTreeTools } = require('../tools/taskTreeTools');
-const { parseSimpleCommand, findMatchingRule, isSandboxed } = require('./commandApprovalService');
 const path = require('path');
 
 /**
@@ -24,9 +23,6 @@ class ToolProcessor {
     this.conversationManager = null;
     this.running = false;
     this._restartNeeded = false;
-
-    /** @type {Map<string, { toolMessageId: number, conversationId: number, command: string, cwd: string, timeout: number }>} */
-    this.pendingApprovalTools = new Map();
   }
 
   setConversationManager(cm) {
@@ -121,8 +117,11 @@ class ToolProcessor {
 
     // Plan mode enforcement: block write-capable tools at the processor level so even
     // if a tool call slips through definitions filtering, the worktree stays read-only.
+    // runCommand is allowed in plan mode: it always runs sandboxed with the worktree
+    // mounted read-only (readOnlyWorktree in _handleRunCommand), so writes are blocked
+    // by bwrap at the filesystem level.
     const writeTools = new Set([
-      'writeFile', 'editFile', 'moveFile', 'deleteFile', 'createDirectory', 'copyFile', 'runCommand'
+      'writeFile', 'editFile', 'moveFile', 'deleteFile', 'createDirectory', 'copyFile'
     ]);
     if (conv?.mode === 'plan' && writeTools.has(toolName)) {
       throw new Error(`Tool '${toolName}' is disabled in plan mode.`);
@@ -133,9 +132,6 @@ class ToolProcessor {
     // Special tools with their own async flow
     if (toolName === 'runCommand') {
       result = await this._handleRunCommand(toolMsg, toolArgs, workingDir, conversationId);
-      if (result && result.requiresApproval) {
-        return; // Tool stays in 'processing' until user approves/denies
-      }
     } else if (toolName === 'investigate') {
       result = await executeTool(toolName, toolArgs, workingDir, context, conversationId);
     } else if (toolName === 'submitFindings') {
@@ -197,7 +193,79 @@ class ToolProcessor {
   }
 
   /**
+   * Returns the sandbox paths marked to be exported into the command PATH
+   * (export_to_path = 1).
+   * @returns {Array<string>} Absolute paths.
+   */
+  _getExportToPathPaths() {
+    try {
+      const rows = this.db.getAllSandboxPaths();
+      return (rows || [])
+        .filter(row => Number(row.export_to_path) === 1)
+        .map(row => row.path);
+    } catch (err) {
+      console.error('[ToolProcessor] Failed to load export-to-PATH paths:', err);
+      return [];
+    }
+  }
+
+  /**
+   * Returns every configured sandbox path (regardless of the export flag).
+   * @returns {Array<string>} Absolute paths.
+   */
+  _getConfiguredSandboxPaths() {
+    try {
+      const rows = this.db.getAllSandboxPaths();
+      return (rows || []).map(row => row.path).filter(Boolean);
+    } catch (err) {
+      console.error('[ToolProcessor] Failed to load sandbox paths:', err);
+      return [];
+    }
+  }
+
+  /**
+   * Builds the environment for a runCommand execution.
+   *
+   * The `PATH` is derived from the process env but the "Export to PATH" flag is
+   * authoritative: a configured sandbox path that is NOT marked for export is
+   * removed from the inherited PATH, then the exported paths are appended.
+   * Without this, a path that already exists in the host PATH (e.g. ~/.deno/bin)
+   * would always be visible and toggling the flag would appear to do nothing.
+   * Standard system directories are never removed.
+   *
+   * @returns {Object} Environment map passed to spawn/bwrap.
+   */
+  _buildRunEnv() {
+    const exported = this._getExportToPathPaths();
+    const exportedSet = new Set(exported);
+    const configured = new Set(this._getConfiguredSandboxPaths());
+
+    const systemPaths = new Set([
+      '/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin',
+      '/sbin', '/bin', '/usr/games', '/usr/local/games', '/snap/bin'
+    ]);
+
+    const merged = (process.env.PATH || '')
+      .split(':')
+      .filter(Boolean)
+      .filter(p => !configured.has(p) || exportedSet.has(p) || systemPaths.has(p));
+
+    for (const p of exported) {
+      if (p && !merged.includes(p)) {
+        merged.push(p);
+      }
+    }
+
+    return { ...process.env, PATH: merged.join(':') };
+  }
+
+  /**
    * Special handler for runCommand.
+   *
+   * runCommand always executes inside the sandbox (bubblewrap). There is no
+   * approval / auto-approval flow anymore: the worktree is mounted read-only
+   * for plan mode and for focus/subbot/project conversations, and extra access
+   * is controlled by the configured sandbox paths.
    */
   async _handleRunCommand(toolMsg, toolArgs, workingDir, conversationId) {
     const command = toolArgs.command || '';
@@ -214,194 +282,42 @@ class ToolProcessor {
       repoRoot,
       worktreePath: worktreePath || repoRoot,
       readOnlyWorktree: conv && ['focus', 'subbot', 'project'].includes(conv.conversation_type) || conv?.mode === 'plan',
-      extraPaths: this._getSandboxExtraPaths()
+      extraPaths: this._getSandboxExtraPaths(),
+      env: this._buildRunEnv()
     };
-
-    const sandboxed = isSandboxed(sandboxOpts);
-
-    const parsedCommand = parseSimpleCommand(command, cwd, workingDir);
 
     // Outer timeout: timeout + 30s buffer, or 5min if no timeout specified
     const maxTimeout = timeout > 0 ? timeout + 30000 : 300000;
 
-    // If sandboxed, skip auto-approval check and run directly with sandbox
-    if (sandboxed) {
-      this.socketService.broadcastToolStart(conversationId, 'runCommand', toolArgs, false, toolMsg.tool_call_id);
-      let result;
-      try {
-        result = await Promise.race([
-          runShellCommand(command, cwd, timeout, sandboxOpts),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Command timeout (outer)')), maxTimeout)
-          )
-        ]);
-        result.sandboxed = true;
-      } catch (err) {
-        result = {
-          stdout: '',
-          stderr: err.message || String(err),
-          exitCode: 1,
-          failed: true,
-          sandboxed: true
-        };
-      }
-
-      this.socketService.broadcastToolEnd(conversationId, 'runCommand', result);
-      return result;
-    }
-
-    const autoApprovalRule = findMatchingRule(this.db, parsedCommand, {
-      worktreePath: workingDir,
-    });
-
-    if (autoApprovalRule) {
-      // Auto-aprovado: executa directamente
-      this.socketService.broadcastToolStart(conversationId, 'runCommand', toolArgs, false, toolMsg.tool_call_id);
-      let result;
-      try {
-        result = await Promise.race([
-          runShellCommand(command, cwd, timeout),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Command timeout (outer)')), maxTimeout)
-          )
-        ]);
-        result.autoApproved = true;
-        result.autoApprovalRuleId = autoApprovalRule.id;
-      } catch (err) {
-        result = {
-          stdout: '',
-          stderr: err.message || String(err),
-          exitCode: 1,
-          failed: true,
-          autoApproved: true,
-          autoApprovalRuleId: autoApprovalRule.id
-        };
-      }
-
-      this.socketService.broadcastToolEnd(conversationId, 'runCommand', result);
-      return result;
-    }
-
-    // Needs user approval
-    this.socketService.broadcastToolStart(conversationId, 'runCommand', toolArgs, true, toolMsg.tool_call_id);
-
-    const approval = this.db.createPendingApproval({
-      tool_call_id: toolMsg.tool_call_id,
-      conversation_id: conversationId,
-      command,
-      cwd,
-      tool_name: 'runCommand',
-      tool_args: toolMsg.tool_args || '{}',
-      expires_at: new Date(Date.now() + 600000).toISOString(), // 10 min
-    });
-
-    this.socketService.broadcastCommandApprovalRequired(conversationId, {
+    console.log('[ToolProcessor] runCommand', {
+      command: command.slice(0, 120),
       conversationId,
-      toolCallId: toolMsg.tool_call_id,
-      command,
-      cwd,
-      expiresAt: approval.expires_at,
-      parsedCommand,
+      readOnlyWorktree: sandboxOpts.readOnlyWorktree,
+      timeout
     });
 
-    // Store to resolve when user responds (via resolveCommandApproval)
-    this.pendingApprovalTools.set(toolMsg.tool_call_id, {
-      toolMessageId: toolMsg.id,
-      conversationId,
-      command,
-      cwd,
-      timeout,
-    });
-
-    return { requiresApproval: true };
-  }
-
-  /**
-   * Resolves a pending command approval.
-   * Called by socketService when the user approves/denies.
-   */
-  async resolveCommandApproval(toolCallId, approved) {
-    const pending = this.pendingApprovalTools.get(toolCallId);
-    if (!pending) {
-      console.log(`[ToolProcessor] No pending approval for toolCallId=${toolCallId}`);
-      return;
-    }
-
-    this.pendingApprovalTools.delete(toolCallId);
-
+    this.socketService.broadcastToolStart(conversationId, 'runCommand', toolArgs, toolMsg.tool_call_id);
+    let result;
     try {
-      let result;
-
-      if (approved) {
-        const conv = this.db.getConversation(pending.conversationId);
-        const repoRoot = conv?.repo_root;
-        const worktreePath = conv?.worktree_path;
-        const sandboxOpts = {
-          enabled: true,
-          repoRoot,
-          worktreePath: worktreePath || repoRoot,
-          readOnlyWorktree: conv && ['focus', 'subbot', 'project'].includes(conv.conversation_type),
-          extraPaths: this._getSandboxExtraPaths()
-        };
-        const maxTimeout = pending.timeout > 0 ? pending.timeout + 30000 : 300000;
-        result = await Promise.race([
-          runShellCommand(pending.command, pending.cwd, pending.timeout, sandboxOpts),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Command timeout (outer)')), maxTimeout)
-          )
-        ]);
-      } else {
-        result = {
-          stdout: '',
-          stderr: 'Command denied by user',
-          exitCode: 1,
-        };
-      }
-
-      // Broadcast tool end
-      this.socketService.broadcastToolEnd(pending.conversationId, 'runCommand', result);
-
-      // Passar ao ConversationManager para actualizar BD e estado
-      if (this.conversationManager) {
-        await this.conversationManager.handleToolResult(
-          pending.conversationId, pending.toolMessageId, result, null
-        );
-      }
+      result = await Promise.race([
+        runShellCommand(command, cwd, timeout, sandboxOpts),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Command timeout (outer)')), maxTimeout)
+        )
+      ]);
+      result.sandboxed = true;
     } catch (err) {
-      console.error(`[ToolProcessor] Error resolving command approval for ${toolCallId}:`, err);
-      if (this.conversationManager) {
-        await this.conversationManager.handleToolResult(
-          pending.conversationId, pending.toolMessageId, null, err
-        );
-      }
+      result = {
+        stdout: '',
+        stderr: err.message || String(err),
+        exitCode: 1,
+        failed: true,
+        sandboxed: true
+      };
     }
-  }
 
-  /**
-   * Cleanup: marca todas as approvals pendentes como erro (para shutdown).
-   */
-  async cleanup() {
-    for (const [toolCallId, pending] of this.pendingApprovalTools) {
-      try {
-        if (this.conversationManager) {
-          await this.conversationManager.handleToolResult(
-            pending.conversationId,
-            pending.toolMessageId,
-            null,
-            new Error('Server shutdown')
-          );
-        }
-      } catch (_) {}
-    }
-    this.pendingApprovalTools.clear();
-  }
-
-  cleanupConversation(conversationId) {
-    for (const [toolCallId, pending] of this.pendingApprovalTools) {
-      if (pending.conversationId == conversationId) {
-        this.pendingApprovalTools.delete(toolCallId);
-      }
-    }
+    this.socketService.broadcastToolEnd(conversationId, 'runCommand', result);
+    return result;
   }
 }
 

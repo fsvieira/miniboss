@@ -6,11 +6,11 @@ export async function getSandboxPaths() {
   return response.json();
 }
 
-export async function createSandboxPath(path, accessMode = 'read') {
+export async function createSandboxPath(path, accessMode = 'read', exportToPath = false) {
   const response = await fetch(`${API_URL}/sandbox/paths`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, access_mode: accessMode })
+    body: JSON.stringify({ path, access_mode: accessMode, export_to_path: exportToPath ? 1 : 0 })
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));

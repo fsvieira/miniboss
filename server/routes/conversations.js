@@ -299,9 +299,6 @@ router.post('/:id/clear', (req, res) => {
   Promise.resolve().then(async () => {
     try {
       await aiController.cancelOperation(req.params.id);
-
-      const toolProcessor = serviceFactory.getToolProcessor();
-      toolProcessor.cleanupConversation(req.params.id);
       aiController.cleanupConversation(req.params.id);
 
       db.deleteAllFocusConversations(req.params.id);
@@ -379,9 +376,6 @@ router.delete('/:id', (req, res) => {
   Promise.resolve()
     .then(async () => {
       await aiController.cancelOperation(req.params.id);
-
-      const toolProcessor = serviceFactory.getToolProcessor();
-      toolProcessor.cleanupConversation(req.params.id);
       aiController.cleanupConversation(req.params.id);
 
       let deletionReport = null;

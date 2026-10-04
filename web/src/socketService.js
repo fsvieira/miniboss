@@ -63,18 +63,6 @@ class SocketService {
       this.emit('context_info', data);
     });
 
-    this.socket.on('command_approval_required', (data) => {
-      this.emit('command_approval_required', data);
-    });
-
-    this.socket.on('approval_handled', (data) => {
-      this.emit('approval_handled', data);
-    });
-
-    this.socket.on('approval_expired', (data) => {
-      this.emit('approval_expired', data);
-    });
-
     this.socket.on('done', (data) => {
       this.emit('done', data);
     });

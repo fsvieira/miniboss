@@ -63,32 +63,6 @@ db.exec(`
       value TEXT NOT NULL
     );
 
-     CREATE TABLE IF NOT EXISTS pending_approvals (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      tool_call_id TEXT NOT NULL UNIQUE,
-      conversation_id INTEGER NOT NULL,
-      command TEXT NOT NULL,
-      cwd TEXT,
-      tool_name TEXT,
-      tool_args TEXT,
-      expires_at DATETIME,
-      closed_at DATETIME,
-      close_reason TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS auto_approval_rules (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      command_name TEXT NOT NULL,
-      rule_hash TEXT NOT NULL UNIQUE,
-      rule_json TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_auto_approval_rules_command_name ON auto_approval_rules(command_name);
-
      CREATE TABLE IF NOT EXISTS project_extra_files (
        id INTEGER PRIMARY KEY AUTOINCREMENT,
        project_id INTEGER NOT NULL,
@@ -115,6 +89,7 @@ db.exec(`
        id INTEGER PRIMARY KEY AUTOINCREMENT,
        path TEXT NOT NULL UNIQUE,
        access_mode TEXT NOT NULL DEFAULT 'read' CHECK(access_mode IN ('read', 'write')),
+       export_to_path INTEGER NOT NULL DEFAULT 0,
        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
      );
@@ -147,19 +122,18 @@ if (!messagesColumns.includes('tool_calls')) {
   db.prepare("ALTER TABLE messages ADD COLUMN tool_calls TEXT").run();
 }
 
-// Migration: add approval lifecycle columns
-const pendingApprovalsColumns = db.prepare("PRAGMA table_info(pending_approvals)").all().map(col => col.name);
-if (!pendingApprovalsColumns.includes('expires_at')) {
-  db.prepare("ALTER TABLE pending_approvals ADD COLUMN expires_at DATETIME").run();
+// Migration: command approval is no longer needed (runCommand always runs in the
+// sandbox). Drop the approval tables if they exist from previous versions.
+db.exec("DROP TABLE IF EXISTS pending_approvals");
+db.exec("DROP TABLE IF EXISTS auto_approval_rules");
+
+// Migration: add export_to_path to sandbox_paths (0 = not exported to PATH, 1 = exported)
+const sandboxPathColumns = db.prepare("PRAGMA table_info(sandbox_paths)").all().map(col => col.name);
+if (!sandboxPathColumns.includes('export_to_path')) {
+  db.prepare("ALTER TABLE sandbox_paths ADD COLUMN export_to_path INTEGER NOT NULL DEFAULT 0").run();
+  db.prepare("UPDATE sandbox_paths SET export_to_path = 0").run();
+  console.log('[DB] Migration: added export_to_path column to sandbox_paths');
 }
-if (!pendingApprovalsColumns.includes('closed_at')) {
-  db.prepare("ALTER TABLE pending_approvals ADD COLUMN closed_at DATETIME").run();
-}
-if (!pendingApprovalsColumns.includes('close_reason')) {
-  db.prepare("ALTER TABLE pending_approvals ADD COLUMN close_reason TEXT").run();
-}
-db.prepare("CREATE INDEX IF NOT EXISTS idx_pending_approvals_conversation_active ON pending_approvals(conversation_id, closed_at, expires_at)").run();
-db.prepare("CREATE INDEX IF NOT EXISTS idx_pending_approvals_tool_call_id ON pending_approvals(tool_call_id)").run();
 
 // Migration: Widen role CHECK to accept 'tool' — SQLite needs table recreation
 const currentTableInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'").get();

@@ -59,7 +59,7 @@ const sandboxRoutes = require('./routes/sandbox');
 // Initialize socket service
 socketService.initialize(io);
 
-// Connect AI controller to socket service for command approvals
+// Connect AI controller to socket service (used for stream cancellation)
 const aiController = require('./controllers/aiControllerSingleton');
 socketService.setAIController(aiController);
 
@@ -104,9 +104,6 @@ const httpServer = server.listen(PORT, HOST, () => {
 async function shutdown(signal) {
   console.log(`[Shutdown] Received ${signal}, shutting down...`);
   try {
-    socketService.stopApprovalExpirySweep();
-    const toolProcessor = serviceFactory.getToolProcessor();
-    if (toolProcessor?.cleanup) await toolProcessor.cleanup();
     const cm = serviceFactory.getConversationManager();
     if (cm?.recoverStuckStates) cm.recoverStuckStates();
   } catch (err) { console.error('[Shutdown] Error:', err); }

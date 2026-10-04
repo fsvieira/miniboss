@@ -52,7 +52,7 @@ function buildBwrapArgs(repoRoot, worktreePath, extraPaths = [], options = {}) {
 }
 
 async function runShellCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts = {}) {
-  const { repoRoot, worktreePath, extraPaths, readOnlyWorktree } = sandboxOpts;
+  const { repoRoot, worktreePath, extraPaths, readOnlyWorktree, env } = sandboxOpts;
 
   if (!repoRoot || !worktreePath) {
     throw new Error('[shellExecutor] Sandbox requires repoRoot and worktreePath');
@@ -73,13 +73,14 @@ async function runShellCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts = 
 
   console.log('[shellExecutor] Running command in sandbox', { cwd: resolvedCwd, command: command.slice(0, 100) });
 
-  return runCommandDirect(fullCommand, cwd, timeoutMs);
+  return runCommandDirect(fullCommand, cwd, timeoutMs, env);
 }
 
-function runCommandDirect(command, cwd, timeoutMs) {
+function runCommandDirect(command, cwd, timeoutMs, env) {
   return new Promise((resolve, reject) => {
     const child = spawn('/bin/sh', ['-c', command], {
       cwd,
+      env: env || process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true
     });
@@ -146,6 +147,14 @@ function runCommandDirect(command, cwd, timeoutMs) {
       const stderrTrimmed = stderr.trim();
       const stdoutTrimmed = stdout.trim();
 
+      console.log('[shellExecutor] Command result', {
+        command: command.slice(0, 120),
+        exitCode: exitCode || 0,
+        timedOut: killed,
+        stdoutLength: stdout.length,
+        stderrLength: stderr.length
+      });
+
       const isBwrapError = stderrTrimmed.startsWith('bwrap:') || 
                            stderrTrimmed.includes('bubblewrap') ||
                            stderrTrimmed.includes('Can\'t find source path') ||
@@ -172,10 +181,15 @@ function runCommandDirect(command, cwd, timeoutMs) {
         return;
       }
 
+      // Sempre incluiremos a mensagem de timeout quando o comando foi morto,
+      // mesmo se já houver output parcial em stderr.
+      const timeoutMsg = killed ? `Command timed out after ${timeoutMs}ms` : '';
       doResolve({
         stdout: stdoutTrimmed,
-        stderr: stderrTrimmed || (killed ? `Command timed out after ${timeoutMs}ms` : ''),
-        exitCode: exitCode || 0,
+        stderr: killed && stderrTrimmed
+          ? `${stderrTrimmed}\n${timeoutMsg}`
+          : (stderrTrimmed || timeoutMsg),
+        exitCode: exitCode || (killed ? 124 : 0),
         failed: exitCode !== 0 && !killed
       });
     });

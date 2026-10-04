@@ -19,6 +19,8 @@ import {
   Slider,
   Switch,
   Chip,
+  Checkbox,
+  FormControlLabel,
   Snackbar,
   Alert,
 } from '@mui/material';
@@ -74,6 +76,7 @@ export default function SettingsPage({ onClose }) {
   const [sandboxPaths, setSandboxPaths] = useState([]);
   const [newPathInput, setNewPathInput] = useState('');
   const [newPathMode, setNewPathMode] = useState('read');
+  const [newPathExport, setNewPathExport] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
   const [toast, setToast] = useState(null);
 
@@ -258,8 +261,9 @@ export default function SettingsPage({ onClose }) {
     const trimmed = newPathInput.trim();
     if (!trimmed) return;
     try {
-      await createSandboxPath(trimmed, newPathMode);
+      await createSandboxPath(trimmed, newPathMode, newPathExport);
       setNewPathInput('');
+      setNewPathExport(false);
       await loadSandboxPaths();
       setToast({ message: 'Path added to sandbox!', severity: 'success' });
     } catch (error) {
@@ -274,6 +278,17 @@ export default function SettingsPage({ onClose }) {
       await loadSandboxPaths();
     } catch (error) {
       setToast({ message: 'Falha ao alterar modo: ' + error.message, severity: 'error' });
+    }
+  };
+
+  const handleTogglePathExport = async (pathEntry) => {
+    const newExport = Number(pathEntry.export_to_path) === 1 ? 0 : 1;
+    try {
+      await updateSandboxPath(pathEntry.id, { export_to_path: newExport });
+      await loadSandboxPaths();
+      setToast({ message: newExport ? 'Path added to command PATH.' : 'Path removed from command PATH.', severity: 'success' });
+    } catch (error) {
+      setToast({ message: 'Falha ao alterar export: ' + error.message, severity: 'error' });
     }
   };
 
@@ -571,6 +586,11 @@ export default function SettingsPage({ onClose }) {
                 <MenuItem value="write">Write</MenuItem>
               </Select>
             </FormControl>
+            <FormControlLabel
+              control={<Checkbox checked={newPathExport} onChange={(e) => setNewPathExport(e.target.checked)} size="small" />}
+              label="Export to PATH"
+              sx={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }}
+            />
             <Button
               variant="outlined"
               onClick={() => setBrowserOpen(true)}
@@ -597,16 +617,30 @@ export default function SettingsPage({ onClose }) {
                     primary={entry.path}
                     primaryTypographyProps={{ noWrap: true, title: entry.path, fontSize: '0.9rem' }}
                     secondary={
-                      <Chip
-                        label={entry.access_mode === 'write' ? 'Write' : 'Read'}
-                        size="small"
-                        color={entry.access_mode === 'write' ? 'warning' : 'default'}
-                        variant="outlined"
-                        sx={{ mt: 0.5, fontSize: '0.65rem', height: 20 }}
-                      />
+                      <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center', mt: 0.25 }}>
+                        <Chip
+                          label={entry.access_mode === 'write' ? 'Write' : 'Read'}
+                          size="small"
+                          color={entry.access_mode === 'write' ? 'warning' : 'default'}
+                          variant="outlined"
+                          sx={{ mt: 0.5, fontSize: '0.65rem', height: 20 }}
+                        />
+                        <Chip
+                          label={Number(entry.export_to_path) === 1 ? 'PATH' : 'No PATH'}
+                          size="small"
+                          color={Number(entry.export_to_path) === 1 ? 'success' : 'default'}
+                          variant="outlined"
+                          sx={{ mt: 0.5, fontSize: '0.65rem', height: 20 }}
+                        />
+                      </Box>
                     }
                   />
                   <ListItemSecondaryAction>
+                    <FormControlLabel
+                      control={<Checkbox checked={Number(entry.export_to_path) === 1} onChange={() => handleTogglePathExport(entry)} size="small" />}
+                      label="PATH"
+                      sx={{ fontSize: '0.7rem' }}
+                    />
                     <Button
                       size="small"
                       onClick={() => handleTogglePathMode(entry)}
@@ -628,7 +662,9 @@ export default function SettingsPage({ onClose }) {
           <Typography variant="subtitle1" sx={{ mb: 1 }}>Tips</Typography>
           <Typography variant="body2" color="text.secondary" component="div">
             <ul style={{ margin: 0, paddingLeft: 20 }}>
-              <li>Add <code>~/.nvm</code> (read) to use npm/node installed via nvm inside the sandbox.</li>
+              <li>Add <code>~/.nvm</code> (read) so the sandbox can access nvm-managed toolchains.</li>
+              <li>To run a tool by name (e.g. <code>node</code>, <code>deno</code>), add its <strong>bin directory</strong> and check <strong>Export to PATH</strong> (e.g. <code>~/.nvm/versions/node/vXX/bin</code>, <code>~/.deno/bin</code>).</li>
+              <li>Exporting to PATH overrides the inherited PATH: unchecking removes that folder from the sandbox PATH.</li>
               <li>Add <code>~/.npm</code> (write) to allow npm to cache packages.</li>
               <li>Add <code>~/.cache</code> (write) for tools that need a writable cache directory.</li>
               <li>Paths that don't exist are skipped automatically.</li>

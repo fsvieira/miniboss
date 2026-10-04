@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js",
-    "test": "node tests/focusSystem.test.js && node tests/projectOverviewTools.test.js && node tests/conversationDeleteReport.test.js"
+    "test": "node tests/focusSystem.test.js && node tests/projectOverviewTools.test.js && node tests/conversationDeleteReport.test.js && node tests/toolProcessorEnv.test.js"
   },
   "keywords": [],
   "author": "",

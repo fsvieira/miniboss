@@ -31,22 +31,6 @@ function isToolMessage(message) {
   return message.role === 'tool';
 }
 
-/**
- * Check if a message is an approval request message.
- */
-function isApprovalRequestMessage(message) {
-  return message.role === 'approval_request';
-}
-
-/**
- * Check if a message is an approval response message.
- */
-function isApprovalResponseMessage(message) {
-  return message.role === 'approval_approved' || message.role === 'approval_denied';
-}
-
-
-
 function MessageContent({ message }) {
   const content = message.error_message || message.content;
 
@@ -350,37 +334,6 @@ function Message({ message, isUser, activeToolIndicators = [], isFocusView = fal
           maxWidth: '80%'
         }}>
           {message.content}
-        </div>
-      </div>
-    );
-  }
-
-  // If it's an approval request message
-  if (isApprovalRequestMessage(message)) {
-    return null;
-  }
-
-  // If it's an approval response message
-  if (isApprovalResponseMessage(message)) {
-    const isApproved = message.role === 'approval_approved';
-    return (
-      <div style={{
-        display: 'flex',
-        justifyContent: 'center',
-        marginBottom: '0.75em'
-      }}>
-        <div style={{
-          padding: '0.4em 1em',
-          borderRadius: '12px',
-          backgroundColor: isApproved ? '#d4edda' : '#f8d7da',
-          border: `1px solid ${isApproved ? '#c3e6cb' : '#f5c6cb'}`,
-          color: isApproved ? '#155724' : '#721c24',
-          fontSize: '0.8em',
-          textAlign: 'center',
-          wordWrap: 'break-word',
-          maxWidth: '80%'
-        }}>
-          {isApproved ? '✓ ' : '✗ '}{message.content}
         </div>
       </div>
     );

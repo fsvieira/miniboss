@@ -35,7 +35,11 @@ router.post('/paths', (req, res) => {
     return res.status(409).json({ error: 'Path already configured', path: existing });
   }
 
-  const created = db.createSandboxPath({ path: resolvedPath, access_mode: mode });
+  const created = db.createSandboxPath({
+    path: resolvedPath,
+    access_mode: mode,
+    export_to_path: req.body.export_to_path ? 1 : 0
+  });
   res.status(201).json(created);
 });
 
@@ -51,6 +55,9 @@ router.put('/paths/:id', (req, res) => {
       return res.status(400).json({ error: 'access_mode must be "read" or "write"' });
     }
     data.access_mode = access_mode;
+  }
+  if (req.body.export_to_path !== undefined) {
+    data.export_to_path = req.body.export_to_path ? 1 : 0;
   }
 
   const updated = db.updateSandboxPath(req.params.id, data);

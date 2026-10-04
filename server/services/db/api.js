@@ -273,7 +273,17 @@ class DatabaseAPI {
    */
   getOrCreateProjectConversation(projectId) {
     const existing = this.getProjectConversation(projectId);
-    if (existing) return existing;
+    if (existing) {
+      // Lazy-migration: rename conversas Project Memory criadas antes da
+      // columna do nome do projeto no título.
+      if (existing.title === 'Project Memory') {
+        const project = this.getProject(projectId);
+        if (project) {
+          return this.updateConversation(existing.id, { title: `Project Memory — ${project.name}` });
+        }
+      }
+      return existing;
+    }
 
     const project = this.getProject(projectId);
     if (!project) return null;
@@ -282,7 +292,7 @@ class DatabaseAPI {
     try {
       return this.createConversation({
         project_id: projectId,
-        title: 'Project Memory',
+        title: `Project Memory — ${project.name}`,
         conversation_type: 'project',
         repo_root: project.folder_path || null,
         worktree_path: null,
@@ -1430,10 +1440,10 @@ class DatabaseAPI {
    */
   createSandboxPath(data) {
     const stmt = this.connection.prepare(`
-      INSERT OR IGNORE INTO sandbox_paths (path, access_mode, created_at, updated_at)
-      VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      INSERT OR IGNORE INTO sandbox_paths (path, access_mode, export_to_path, created_at, updated_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `);
-    const result = stmt.run(data.path, data.access_mode || 'read');
+    const result = stmt.run(data.path, data.access_mode || 'read', data.export_to_path ? 1 : 0);
     return this.getSandboxPath(result.lastInsertRowid);
   }
 
@@ -1444,7 +1454,7 @@ class DatabaseAPI {
    */
   getSandboxPath(id) {
     const stmt = this.connection.prepare(`
-      SELECT id, path, access_mode, created_at, updated_at
+      SELECT id, path, access_mode, export_to_path, created_at, updated_at
       FROM sandbox_paths
       WHERE id = ?
     `);
@@ -1457,7 +1467,7 @@ class DatabaseAPI {
    */
   getAllSandboxPaths() {
     const stmt = this.connection.prepare(`
-      SELECT id, path, access_mode, created_at, updated_at
+      SELECT id, path, access_mode, export_to_path, created_at, updated_at
       FROM sandbox_paths
       ORDER BY path ASC
     `);
@@ -1470,6 +1480,7 @@ class DatabaseAPI {
    * @param {Object} data - Data to update.
    * @param {string} [data.path] - Novo caminho.
    * @param {string} [data.access_mode] - Novo modo de acesso.
+   * @param {number|boolean} [data.export_to_path] - Se o path é exportado ao PATH.
    * @returns {Object|null} Updated path or null if not found.
    */
   updateSandboxPath(id, data) {
@@ -1483,6 +1494,10 @@ class DatabaseAPI {
     if (data.access_mode !== undefined) {
       updates.push('access_mode = ?');
       params.push(data.access_mode);
+    }
+    if (data.export_to_path !== undefined) {
+      updates.push('export_to_path = ?');
+      params.push(data.export_to_path ? 1 : 0);
     }
 
     if (updates.length === 0) {
@@ -1511,221 +1526,6 @@ class DatabaseAPI {
    */
   deleteSandboxPath(id) {
     const stmt = this.connection.prepare('DELETE FROM sandbox_paths WHERE id = ?');
-    const result = stmt.run(id);
-    return result.changes > 0;
-  }
-
-  // ===== AUTO APPROVAL RULES =====
-
-  createAutoApprovalRule(data) {
-    const existing = this.getAutoApprovalRuleByHash(data.rule_hash);
-    if (existing) {
-      return existing;
-    }
-
-    const stmt = this.connection.prepare(`
-      INSERT INTO auto_approval_rules (command_name, rule_hash, rule_json, created_at, updated_at)
-      VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-    `);
-
-    const result = stmt.run(
-      data.command_name,
-      data.rule_hash,
-      data.rule_json
-    );
-
-    return this.getAutoApprovalRule(result.lastInsertRowid);
-  }
-
-  getAutoApprovalRule(id) {
-    const stmt = this.connection.prepare(`
-      SELECT id, command_name, rule_hash, rule_json, created_at, updated_at
-      FROM auto_approval_rules
-      WHERE id = ?
-    `);
-
-    return stmt.get(id) || null;
-  }
-
-  getAutoApprovalRuleByHash(ruleHash) {
-    const stmt = this.connection.prepare(`
-      SELECT id, command_name, rule_hash, rule_json, created_at, updated_at
-      FROM auto_approval_rules
-      WHERE rule_hash = ?
-    `);
-
-    return stmt.get(ruleHash) || null;
-  }
-
-  getAutoApprovalRulesByCommand(commandName) {
-    const stmt = this.connection.prepare(`
-      SELECT id, command_name, rule_hash, rule_json, created_at, updated_at
-      FROM auto_approval_rules
-      WHERE command_name = ?
-      ORDER BY created_at ASC
-    `);
-
-    return stmt.all(commandName);
-  }
-
-  countAutoApprovalRulesByCommand(commandName) {
-    const stmt = this.connection.prepare(`
-      SELECT COUNT(*) AS count
-      FROM auto_approval_rules
-      WHERE command_name = ?
-    `);
-
-    return stmt.get(commandName)?.count || 0;
-  }
-
-  // ===== PENDING APPROVALS CRUD =====
-
-  /**
-   * Creates a new pending approval.
-   * @param {Object} data - Pending approval data.
-   * @param {string} data.tool_call_id - ID da chamada de ferramenta.
-   * @param {number} data.conversation_id - ID da conversa.
-   * @param {string} data.command - Comando a executar.
-   * @param {string} [data.cwd] - Working directory.
-   * @param {string} [data.tool_name] - Nome da ferramenta.
-   * @param {string} [data.tool_args] - Argumentos da ferramenta.
-   * @returns {Object} Pending approval created with ID.
-   */
-  createPendingApproval(data) {
-    // Close any existing open approval with the same tool_call_id first
-    this.closePendingApprovalByToolCallId(data.tool_call_id, 'superseded');
-
-    // Use INSERT OR REPLACE to handle the case where a closed row with the
-    // same tool_call_id already exists (UNIQUE constraint on tool_call_id)
-    const stmt = this.connection.prepare(`
-      INSERT OR REPLACE INTO pending_approvals (tool_call_id, conversation_id, command, cwd, tool_name, tool_args, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    const result = stmt.run(
-      data.tool_call_id,
-      data.conversation_id,
-      data.command,
-      data.cwd || null,
-      data.tool_name || null,
-      data.tool_args || null,
-      data.expires_at || null
-    );
-
-    return this.getPendingApproval(result.lastInsertRowid);
-  }
-
-  /**
-   * Fetches a pending approval by ID.
-   * @param {number} id - Pending approval ID.
-   * @returns {Object|null} Found pending approval or null.
-   */
-  getPendingApproval(id) {
-    const stmt = this.connection.prepare(`
-      SELECT id, tool_call_id, conversation_id, command, cwd, tool_name, tool_args,
-             expires_at, closed_at, close_reason, created_at, updated_at
-      FROM pending_approvals
-      WHERE id = ?
-    `);
-
-    return stmt.get(id) || null;
-  }
-
-  getPendingApprovalByToolCallId(toolCallId) {
-    const stmt = this.connection.prepare(`
-      SELECT id, tool_call_id, conversation_id, command, cwd, tool_name, tool_args,
-             expires_at, closed_at, close_reason, created_at, updated_at
-      FROM pending_approvals
-      WHERE tool_call_id = ?
-    `);
-
-    return stmt.get(toolCallId) || null;
-  }
-
-  /**
-   * Lists pending approvals of a conversation.
-   * @param {number} conversationId - ID da conversa.
-   * @returns {Array} Array of pending approvals.
-   */
-  getPendingApprovalsByConversation(conversationId, options = {}) {
-    const includeClosed = options.includeClosed === true;
-    const stmt = this.connection.prepare(`
-      SELECT id, tool_call_id, conversation_id, command, cwd, tool_name, tool_args,
-             expires_at, closed_at, close_reason, created_at, updated_at
-      FROM pending_approvals
-      WHERE conversation_id = ?
-        AND (
-          ? = 1
-          OR (
-            closed_at IS NULL
-            AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
-          )
-        )
-      ORDER BY created_at ASC
-    `);
-
-    return stmt.all(conversationId, includeClosed ? 1 : 0);
-  }
-
-  closePendingApprovalByToolCallId(toolCallId, closeReason = 'handled') {
-    const stmt = this.connection.prepare(`
-      UPDATE pending_approvals
-      SET closed_at = CURRENT_TIMESTAMP,
-          close_reason = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE tool_call_id = ?
-        AND closed_at IS NULL
-    `);
-    const result = stmt.run(closeReason, toolCallId);
-    return result.changes > 0;
-  }
-
-  expirePendingApprovals() {
-    const findStmt = this.connection.prepare(`
-      SELECT id, tool_call_id, conversation_id, command, cwd, tool_name, tool_args,
-             expires_at, closed_at, close_reason, created_at, updated_at
-      FROM pending_approvals
-      WHERE closed_at IS NULL
-        AND expires_at IS NOT NULL
-        AND expires_at <= CURRENT_TIMESTAMP
-      ORDER BY expires_at ASC
-    `);
-    const closeStmt = this.connection.prepare(`
-      UPDATE pending_approvals
-      SET closed_at = CURRENT_TIMESTAMP,
-          close_reason = 'expired',
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-        AND closed_at IS NULL
-    `);
-
-    const tx = this.connection.transaction(() => {
-      const approvals = findStmt.all();
-      const expired = [];
-
-      for (const approval of approvals) {
-        const result = closeStmt.run(approval.id);
-        if (result.changes > 0) {
-          expired.push({
-            ...approval,
-            close_reason: 'expired'
-          });
-        }
-      }
-
-      return expired;
-    });
-
-    return tx();
-  }
-
-  /**
-   * Deletes a pending approval.
-   * @param {number} id - Pending approval ID.
-   * @returns {boolean} True if the approval was deleted.
-   */
-  deletePendingApproval(id) {
-    const stmt = this.connection.prepare('DELETE FROM pending_approvals WHERE id = ?');
     const result = stmt.run(id);
     return result.changes > 0;
   }

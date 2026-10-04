@@ -103,9 +103,10 @@ async function executeTool(toolName, args, workingDir, context = {}, conversatio
       }
 
       case 'runCommand':
-        // This will be handled specially in aiController with user validation
-        result = { requiresApproval: true, command: args.command, cwd: workingDir, timeout: args.timeout || 0 };
-        break;
+        // runCommand is handled by ToolProcessor (always sandboxed).
+        // This fallback is unreachable because toolProcessor._executeToolHandler
+        // intercepts runCommand before calling executeTool.
+        throw new Error('runCommand must be executed through the ToolProcessor');
 
       case 'investigate':
         if (conversationId) {

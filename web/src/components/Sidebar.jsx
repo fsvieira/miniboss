@@ -38,7 +38,6 @@ export default function Sidebar({
   onSelectConversation,
   selectedConversationId,
   aiGeneratingConversations = new Set(),
-  pendingApprovalConversationIds = new Set(),
   conversationStatuses = {},
 }) {
   const theme = useTheme();
@@ -145,7 +144,6 @@ export default function Sidebar({
               <Box sx={{ pl: 4 }}>
                 {/* Lista de conversas */}
                 {project.conversations?.map((conv) => {
-                  const hasPendingApproval = pendingApprovalConversationIds.has(conv.id);
                   const hasUnread = chatStore.unreadConversationIds.has(conv.id);
                   const isSelected = conv.id === selectedConversationId;
                   const status = conversationStatuses[conv.id] || conv.status || 'completed';
@@ -160,12 +158,12 @@ export default function Sidebar({
                       py: 0.5,
                       backgroundColor: isSelected
                         ? 'rgba(10, 31, 68, 0.08)'
-                        : (hasPendingApproval ? '#ffebee' : (hasUnread ? '#fffde7' : 'transparent')),
-                      borderLeft: isSelected ? '3px solid #0a1f44' : (hasPendingApproval ? '3px solid #d32f2f' : '3px solid transparent'),
+                        : (hasUnread ? '#fffde7' : 'transparent'),
+                      borderLeft: isSelected ? '3px solid #0a1f44' : '3px solid transparent',
                       '&:hover': {
                         backgroundColor: isSelected
                           ? 'rgba(10, 31, 68, 0.12)'
-                          : (hasPendingApproval ? '#ffcdd2' : (hasUnread ? '#fff9c4' : 'rgba(0, 0, 0, 0.04)')),
+                          : (hasUnread ? '#fff9c4' : 'rgba(0, 0, 0, 0.04)'),
                       },
                     }}
                   >
@@ -184,8 +182,8 @@ export default function Sidebar({
                         primaryTypographyProps={{
                           noWrap: true,
                           title: conv.title,
-                          color: isSelected ? '#0a1f44' : (hasPendingApproval ? '#b71c1c' : 'inherit'),
-                          fontWeight: isSelected || hasPendingApproval || conv.conversation_type === 'project' ? 600 : 400,
+                          color: isSelected ? '#0a1f44' : 'inherit',
+                          fontWeight: isSelected || conv.conversation_type === 'project' ? 600 : 400,
                         }}
                       />
                     </Box>

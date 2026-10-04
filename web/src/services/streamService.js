@@ -51,7 +51,7 @@ class StreamService {
 
       eventHandlers.tool_start = (data) => {
         if (abortController.signal.aborted || !matchesConversation(data)) return;
-        callbacks.onToolStart?.(data.tool, data.args, data.approval_pending, data.tool_call_id);
+        callbacks.onToolStart?.(data.tool, data.args, data.tool_call_id);
       };
 
       eventHandlers.tool_end = (data) => {
@@ -72,11 +72,6 @@ class StreamService {
       eventHandlers.message = (data) => {
         if (abortController.signal.aborted || !matchesConversation(data)) return;
         callbacks.onMessage?.(data);
-      };
-
-      eventHandlers.command_approval_required = (data) => {
-        if (abortController.signal.aborted || !matchesConversation(data)) return;
-        callbacks.onCommandApprovalRequired?.(data);
       };
 
       // Terminal events. Even after abort, we continue listening to them: the UI only
@@ -132,7 +127,7 @@ class StreamService {
         // We remove ONLY the incremental event listeners. We keep
         // done/finish/error para que a UI desbloqueie quando o servidor
         // confirmar que o loop parou por completo (stream_cancelled/done).
-        ['text', 'tool_start', 'tool_end', 'checkpoint', 'checkpoint_complete', 'message', 'command_approval_required'].forEach(event => {
+        ['text', 'tool_start', 'tool_end', 'checkpoint', 'checkpoint_complete', 'message'].forEach(event => {
           socketService.off(event, eventHandlers[event]);
         });
 

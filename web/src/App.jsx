@@ -323,7 +323,6 @@ const App = observer(function App() {
           selectedConversationId={selectedConversation?.id}
           aiGeneratingConversations={chatStore.aiGeneratingConversationIds}
           unreadConversationIds={chatStore.unreadConversationIds}
-          pendingApprovalConversationIds={chatStore.pendingApprovalConversationIds}
           conversationStatuses={chatStore.conversationStatusById}
         />
         <Box

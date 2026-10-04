@@ -459,16 +459,40 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
     const taskTools = createTaskTreeTools(conversationId);
 
     // Enforce plan mode read-only filtering for ALL conversation types that support mode switching.
-    // This removes write tools and runCommand from the exposed tool list when conversationMode === 'plan'.
+    // This removes write tools from the exposed tool list when conversationMode === 'plan'.
+    // runCommand IS allowed in plan mode: it always executes in the read-only sandbox
+    // (worktree mounted read-only), so writes are blocked by bwrap.
     const isPlanMode = conversationMode === 'plan';
     if (isPlanMode) {
       const writeTools = [
-        'writeFile', 'editFile', 'moveFile', 'deleteFile', 'createDirectory', 'copyFile', 'runCommand'
+        'writeFile', 'editFile', 'moveFile', 'deleteFile', 'createDirectory', 'copyFile'
       ];
       for (let i = tools.length - 1; i >= 0; i--) {
         if (writeTools.includes(tools[i].function.name)) {
           tools.splice(i, 1);
         }
+      }
+      // Re-add runCommand with a read-only sandbox description (plan mode).
+      const runCommandIdx = tools.findIndex(t => t?.function?.name === 'runCommand');
+      if (runCommandIdx !== -1) {
+        tools[runCommandIdx].function.description =
+          'Execute a shell command in a READ-ONLY sandbox (the worktree is mounted read-only in plan mode). Use for inspection, tests, builds, or lint. Write attempts are blocked by the sandbox.';
+      } else {
+        tools.push({
+          type: 'function',
+          function: {
+            name: 'runCommand',
+            description: 'Execute a shell command in a READ-ONLY sandbox (the worktree is mounted read-only in plan mode). Use for inspection, tests, builds, or lint. Write attempts are blocked by the sandbox.',
+            parameters: {
+              type: 'object',
+              properties: {
+                command: { type: 'string', description: 'The shell command to execute. CWD = the project worktree.' },
+                timeout: { type: 'number', description: 'Timeout in milliseconds. Default: no timeout.' }
+              },
+              required: ['command']
+            }
+          }
+        });
       }
     }
 
