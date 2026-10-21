@@ -11,6 +11,9 @@ const {
   buildContainerEnv,
   buildCreateArgs,
   buildExecArgs,
+  buildCaptureCommand,
+  buildStackLimitedCommand,
+  resolveCapturedResult,
   containerNameFor,
   isImageMissingError,
   isContainerMissingError,
@@ -106,6 +109,47 @@ function runTests() {
     assert.ok(/^[0-9a-f]+$/.test(key), 'the key must be safe to store in a podman label');
   });
 
+  // ── Output exchange mount ───────────────────────────────────────────────
+
+  check('the output exchange is mounted read-write at an explicit target', () => {
+    const ioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-io-'));
+    try {
+      const mounts = buildMountMap({
+        repoRoot,
+        worktreePath,
+        ioDir,
+        ioTarget: '/var/lib/miniboss/io',
+      });
+      const io = mounts.find(m => m.source === ioDir);
+      assert.ok(io, 'the exchange directory must be mounted');
+      assert.strictEqual(io.readOnly, false, 'the exchange directory is scratch space');
+      assert.strictEqual(io.target, '/var/lib/miniboss/io', 'the mount target is explicit');
+    } finally {
+      fs.rmSync(ioDir, { recursive: true, force: true });
+    }
+  });
+
+  check('a missing output exchange directory is skipped', () => {
+    const missing = path.join(os.tmpdir(), `miniboss-sandbox-io-missing-${process.pid}`);
+    const mounts = buildMountMap({
+      repoRoot,
+      worktreePath,
+      ioDir: missing,
+      ioTarget: '/var/lib/miniboss/io',
+    });
+    assert.ok(!mounts.some(m => m.source === missing), 'a non-existent exchange directory must be skipped');
+  });
+
+  check('the mount key distinguishes the same source with different targets', () => {
+    const a = buildMountsKey([
+      { source: '/test/share', target: '/test/share', readOnly: true },
+    ]);
+    const b = buildMountsKey([
+      { source: '/test/share', target: '/var/lib/miniboss/io', readOnly: true },
+    ]);
+    assert.notStrictEqual(a, b, 'the target is part of the container identity');
+  });
+
   // ── Environment allowlist (D7) ──────────────────────────────────────────
 
   check('the container env is an explicit allowlist', () => {
@@ -182,6 +226,161 @@ function runTests() {
       network: 'none',
     });
     assert.strictEqual(argValue(args, '--network'), 'none');
+  });
+
+  // ── Container resources ─────────────────────────────────────────────────
+
+  check('podman create raises /dev/shm', () => {
+    const args = buildCreateArgs({
+      name: 'miniboss-1',
+      image: 'image',
+      mounts: [],
+      env: {},
+      labels: {},
+      shmSize: '1g',
+    });
+    assert.strictEqual(argValue(args, '--shm-size'), '1g');
+  });
+
+  check('podman create only sets the stack limit when it is asked for', () => {
+    // `podman create --ulimit stack=` makes the apt method crash with SIGSEGV
+    // in rootless containers, so it is opt-in.
+    const without = buildCreateArgs({ name: 'miniboss-1', image: 'image', mounts: [], env: {}, labels: {} });
+    assert.strictEqual(argValue(without, '--ulimit'), null);
+
+    const with_ = buildCreateArgs({
+      name: 'miniboss-1',
+      image: 'image',
+      mounts: [],
+      env: {},
+      labels: {},
+      ulimitStack: '65536:65536',
+    });
+    assert.strictEqual(argValue(with_, '--ulimit'), 'stack=65536:65536');
+  });
+
+  check('podman create can leave /dev/shm untouched', () => {
+    const args = buildCreateArgs({
+      name: 'miniboss-1',
+      image: 'image',
+      mounts: [],
+      env: {},
+      labels: {},
+      shmSize: '',
+    });
+    assert.strictEqual(argValue(args, '--shm-size'), null);
+  });
+
+  check('the stack limit is raised inside the command', () => {
+    const limited = buildStackLimitedCommand('echo hi', '65536');
+    assert.ok(limited.startsWith('ulimit -s 65536'), 'the ulimit builtin raises the soft limit');
+    assert.ok(limited.endsWith('echo hi'), 'the command is preserved');
+    assert.strictEqual(buildStackLimitedCommand('echo hi', null), 'echo hi');
+  });
+
+  // ── Output capture ──────────────────────────────────────────────────────
+
+  check('the capture command redirects the output and records the exit code', () => {
+    const command = buildCaptureCommand('echo hello', { ioTarget: '/var/lib/miniboss/io', id: 'run-1' });
+
+    assert.ok(command.includes('if [ -f'), 'the capture needs the mount sentinel');
+    assert.ok(command.includes('/var/lib/miniboss/io/run-1.out'), 'stdout is captured in a file');
+    assert.ok(command.includes('/var/lib/miniboss/io/run-1.err'), 'stderr is captured in a file');
+    assert.ok(command.includes('/var/lib/miniboss/io/run-1.rc'), 'the exit code is captured in a file');
+    assert.ok(command.includes('printf %s "$?"'), 'the exit code is the status of the command');
+    assert.ok(command.includes('else'), 'there must be a fallback branch');
+    assert.ok(command.includes("sh -c 'echo hello'"), 'the command runs exactly once per branch');
+  });
+
+  check('the capture command keeps the timeout wrapper inside the redirected block', () => {
+    const command = buildCaptureCommand(
+      "timeout -k 5 30 /bin/sh -c 'sleep 60'",
+      { ioTarget: '/var/lib/miniboss/io', id: 'run-2' }
+    );
+    const lines = command.split('\n');
+    const redirectIndex = lines.findIndex(line => line.includes('run-2.out'));
+    const timeoutIndex = lines.findIndex(line => line.includes('timeout -k 5 30'));
+    assert.ok(redirectIndex !== -1 && timeoutIndex !== -1, 'the command must be redirected');
+    assert.strictEqual(redirectIndex, timeoutIndex, 'the timeout wrapper is inside the redirected block');
+  });
+
+  check('the capture result prefers the files over the exec stream', () => {
+    const ioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-capture-'));
+    try {
+      const id = 'run-3';
+      fs.writeFileSync(path.join(ioDir, `${id}.out`), 'file stdout\n');
+      fs.writeFileSync(path.join(ioDir, `${id}.err`), 'file stderr\n');
+      fs.writeFileSync(path.join(ioDir, `${id}.rc`), '7\n');
+
+      const result = resolveCapturedResult({
+        mode: 'file',
+        ioDir,
+        id,
+        stream: { stdout: '', stderr: '', exitCode: 0 },
+      });
+
+      assert.strictEqual(result.stdout, 'file stdout');
+      assert.strictEqual(result.stderr, 'file stderr');
+      assert.strictEqual(result.exitCode, 7);
+      assert.strictEqual(result.failed, true);
+      assert.strictEqual(result.captureSource, 'file');
+    } finally {
+      fs.rmSync(ioDir, { recursive: true, force: true });
+    }
+  });
+
+  check('the capture result falls back to the exec stream without the exit code file', () => {
+    const ioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-capture-'));
+    try {
+      const result = resolveCapturedResult({
+        mode: 'file',
+        ioDir,
+        id: 'run-4',
+        stream: { stdout: 'stream stdout', stderr: '', exitCode: 0 },
+      });
+
+      assert.strictEqual(result.stdout, 'stream stdout');
+      assert.strictEqual(result.exitCode, 0);
+      assert.strictEqual(result.captureSource, 'fallback');
+      assert.ok(result.stderr.includes('fell back to the exec stream'), 'the fallback is reported');
+    } finally {
+      fs.rmSync(ioDir, { recursive: true, force: true });
+    }
+  });
+
+  check('the capture result reports a timeout recorded in the exit code file', () => {
+    const ioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-capture-'));
+    try {
+      const id = 'run-5';
+      fs.writeFileSync(path.join(ioDir, `${id}.out`), '');
+      fs.writeFileSync(path.join(ioDir, `${id}.err`), '');
+      fs.writeFileSync(path.join(ioDir, `${id}.rc`), '124');
+
+      const result = resolveCapturedResult({
+        mode: 'file',
+        ioDir,
+        id,
+        stream: { stdout: '', stderr: '', exitCode: 0 },
+      });
+
+      assert.strictEqual(result.exitCode, 124);
+      assert.strictEqual(result.timedOut, true);
+    } finally {
+      fs.rmSync(ioDir, { recursive: true, force: true });
+    }
+  });
+
+  check('the stream mode ignores the capture files', () => {
+    const result = resolveCapturedResult({
+      mode: 'stream',
+      ioDir: null,
+      id: null,
+      stream: { stdout: 'raw stream', stderr: 'raw stderr', exitCode: 0 },
+    });
+
+    assert.strictEqual(result.stdout, 'raw stream');
+    assert.strictEqual(result.captureSource, 'stream');
+    assert.ok(!result.stderr.includes('fell back'), 'the stream mode is not a fallback');
   });
 
   // ── podman exec ─────────────────────────────────────────────────────────

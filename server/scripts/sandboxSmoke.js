@@ -22,6 +22,9 @@ const { execFileSync } = require('child_process');
 const { runPodmanCommand, stopIdleContainers, removeContainerForConversation } = require('../services/sandbox/podmanExecutor');
 const { getSandboxConfig, resolvePodmanBinary, buildPodmanEnv } = require('../services/sandbox/runtime');
 
+/** Root of the MiniBoss repository (the repository setup script under test). */
+const MINIBOSS_ROOT = path.resolve(__dirname, '..', '..');
+
 const CONVERSATION_ID = `smoke-${process.pid}`;
 const ROOT = path.join(os.tmpdir(), `miniboss-sandbox-smoke-${process.pid}`);
 
@@ -71,21 +74,41 @@ async function main() {
   execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: 'ignore' });
   execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repoRoot, stdio: 'ignore' });
 
-  // The setup script marks itself as executed, so we can prove it runs only once.
+  // The repository setup script is the REAL one of this repository: the test
+  // proves the split between the global script (generic toolbox) and the
+  // repository script (project-specific tools).
+  //
+  // Two probes are injected around it:
+  //   - `setup-runs.log`  → the script marks itself as executed (runs once);
+  //   - `tool-before`     → what the generic toolbox had installed *before*
+  //                         the repository script ran (must NOT contain the
+  //                         project-specific tools).
   const setupDir = path.join(worktreePath, '.miniboss');
   fs.mkdirSync(setupDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(setupDir, 'setup.sh'),
+  const repositorySetup = path.join(MINIBOSS_ROOT, '.miniboss', 'setup.sh');
+  const setupBody = fs.existsSync(repositorySetup)
+    ? fs.readFileSync(repositorySetup, 'utf8')
+    : [
+        '#!/bin/sh',
+        'set -e',
+        'export DEBIAN_FRONTEND=noninteractive',
+        'apt-get update -qq',
+        'apt-get install -y -qq --no-install-recommends sqlite3',
+        'rm -rf /var/lib/apt/lists/*',
+        '',
+      ].join('\n');
+  const setupScript = setupBody.replace(
+    /^#!.*\n/,
     [
       '#!/bin/sh',
-      'set -e',
       'echo "setup ran at $(date +%s)" >> /home/miniboss/setup-runs.log',
       'echo "setup-ok" > /home/miniboss/setup-marker',
+      'echo "before=$(command -v sqlite3 || echo missing)" > /home/miniboss/tool-before',
       'echo "SETUP COMPLETED"',
       '',
-    ].join('\n'),
-    { mode: 0o755 }
+    ].join('\n')
   );
+  fs.writeFileSync(path.join(setupDir, 'setup.sh'), setupScript, { mode: 0o755 });
 
   const baseOpts = {
     repoRoot,
@@ -163,6 +186,77 @@ async function main() {
       'the npm cache is the container-owned one (not the read-only host cache)',
       npmCache.stdout.includes('/home/miniboss'),
       npmCache.stdout
+    );
+
+    // ── 9. The output capture returns the whole output ─────────────────────
+    const big = await runPodmanCommand(
+      "head -c 3000 /dev/zero | tr '\\0' 'a'",
+      worktreePath,
+      30000,
+      baseOpts
+    );
+    assert(
+      'a 3 KB output comes back complete',
+      big.stdout.length === 3000,
+      `bytes=${big.stdout.length} exit=${big.exitCode} ${big.stderr}`
+    );
+    assert('the exit code of the big output is 0', big.exitCode === 0, `exit=${big.exitCode}`);
+
+    // ── 10. stdout, stderr and the exit code are captured ─────────────────
+    const mixed = await runPodmanCommand('echo to-stdout; echo to-stderr 1>&2; exit 7', worktreePath, 30000, baseOpts);
+    assert('stdout is captured', mixed.stdout.includes('to-stdout'), `stdout=${mixed.stdout}`);
+    assert('stderr is captured', mixed.stderr.includes('to-stderr'), `stderr=${mixed.stderr}`);
+    assert('the exit code is captured', mixed.exitCode === 7, `exit=${mixed.exitCode}`);
+
+    // ── 11. Plan mode: the exchange is rw, the worktree is ro ─────────────
+    const planOutput = await runPodmanCommand('echo plan-ok', worktreePath, 30000, planOpts);
+    assert(
+      'the container still works in plan mode',
+      planOutput.stdout.includes('plan-ok'),
+      `stdout=${planOutput.stdout} ${planOutput.stderr}`
+    );
+
+    let mounts = [];
+    try {
+      mounts = JSON.parse(String(run(null, [
+        'inspect', `miniboss-${CONVERSATION_ID}`, '--format', '{{json .Mounts}}',
+      ])).trim());
+    } catch (err) {
+      fail('the container mounts can be inspected', err && err.message ? err.message : String(err));
+    }
+    const ioMount = mounts.find(m => String(m.Destination || '').endsWith('/io'));
+    assert('the output exchange is mounted read-write', ioMount && ioMount.RW === true, JSON.stringify(ioMount || null));
+    const worktreeMount = mounts.find(m => String(m.Destination || '') === worktreePath);
+    assert('the worktree is mounted read-only in plan mode', worktreeMount && worktreeMount.RW === false, JSON.stringify(worktreeMount || null));
+
+    // ── 12. The global setup installed the generic toolbox ────────────────
+    const generic = await runPodmanCommand(
+      'command -v jq; command -v rg; command -v ip',
+      worktreePath,
+      30000,
+      baseOpts
+    );
+    const genericFound = String(generic.stdout || '').split('\n').map(l => l.trim()).filter(Boolean);
+    const genericMissing = ['jq', 'rg', 'ip'].filter(t => !genericFound.some(f => f.endsWith(`/${t}`)));
+    assert(
+      'the global setup installed the generic tools (jq, rg, ip)',
+      genericMissing.length === 0,
+      `missing: ${genericMissing.join(', ')}`
+    );
+
+    // ── 13. The repository setup installed the project-specific tools ─────
+    const projectTool = await runPodmanCommand('command -v sqlite3', worktreePath, 30000, baseOpts);
+    assert(
+      'the repository setup installed sqlite3',
+      /\/sqlite3$/.test(String(projectTool.stdout || '').trim()),
+      `stdout=${projectTool.stdout} ${projectTool.stderr}`
+    );
+
+    const before = await runPodmanCommand('cat /home/miniboss/tool-before', worktreePath, 30000, baseOpts);
+    assert(
+      'the global setup did NOT install the project-specific tools',
+      before.stdout.trim() === 'before=missing',
+      `stdout=${before.stdout.trim()} (the global script must not provide sqlite3)`
     );
   } finally {
     try {

@@ -9,6 +9,9 @@ const {
   resolvePodmanBinary,
   buildPodmanEnv,
   hasNewuidmap,
+  getSandboxIoDir,
+  getSandboxIoKey,
+  getSandboxStackLimit,
 } = require('./runtime');
 
 /**
@@ -65,7 +68,7 @@ const INIT_COMMAND = 'trap "kill -TERM 0" TERM INT; sleep infinity & wait';
  * It is part of the container identity: when it changes, the containers created
  * by an older version of MiniBoss are recreated instead of being reused.
  */
-const CONTAINER_SPEC_VERSION = '2';
+const CONTAINER_SPEC_VERSION = '3';
 
 /** @type {Map<string, Object>} conversationId -> container state */
 const containerStates = new Map();
@@ -83,20 +86,29 @@ const lastActivity = new Map();
  * @param {string} params.worktreePath
  * @param {boolean} [params.readOnlyWorktree]
  * @param {Array<{path: string, writable: boolean}>} [params.extraPaths]
+ * @param {string} [params.ioDir] - Host directory of the output exchange.
+ * @param {string} [params.ioTarget] - Mount point of the exchange inside the container.
  * @returns {Array<{source: string, target: string, readOnly: boolean}>}
  */
 function buildMountMap(params = {}) {
-  const { repoRoot, worktreePath, readOnlyWorktree = false, extraPaths = [] } = params;
+  const {
+    repoRoot,
+    worktreePath,
+    readOnlyWorktree = false,
+    extraPaths = [],
+    ioDir = null,
+    ioTarget = null,
+  } = params;
 
   const mounts = [];
   const seen = new Set();
 
-  const push = (source, readOnly) => {
+  const push = (source, readOnly, target = source) => {
     if (!source) return;
     const resolved = path.resolve(source);
     if (seen.has(resolved)) return;
     seen.add(resolved);
-    mounts.push({ source: resolved, target: resolved, readOnly });
+    mounts.push({ source: resolved, target: path.resolve(target), readOnly });
   };
 
   // The worktree is mounted first so that it wins over the repository root when
@@ -120,6 +132,19 @@ function buildMountMap(params = {}) {
     push(resolved, !(entry.writable === true || entry.access_mode === 'write'));
   }
 
+  // The output exchange: the command writes stdout/stderr/exit-code there and
+  // the host reads the files back. It is read-write on purpose (scratch space)
+  // and lives outside the worktree, so the read-only guarantee of plan mode
+  // is not affected.
+  if (ioDir && ioTarget) {
+    const resolvedIo = path.resolve(ioDir);
+    if (fs.existsSync(resolvedIo)) {
+      push(resolvedIo, false, ioTarget);
+    } else {
+      console.warn(`[podmanExecutor] Skipping sandbox I/O directory (does not exist): ${resolvedIo}`);
+    }
+  }
+
   return mounts;
 }
 
@@ -128,12 +153,15 @@ function buildMountMap(params = {}) {
  * outdated (e.g. plan mode flipped the worktree to read-only).
  * It is a digest so it can be stored safely in a podman label.
  *
- * @param {Array<{source: string, readOnly: boolean}>} mounts
+ * The target is part of the key: the same source mounted at two different
+ * targets is a different mount map.
+ *
+ * @param {Array<{source: string, target: string, readOnly: boolean}>} mounts
  * @returns {string}
  */
 function buildMountsKey(mounts) {
   const payload = mounts
-    .map(m => `${m.source}:${m.readOnly ? 'ro' : 'rw'}`)
+    .map(m => `${m.source}->${m.target || m.source}:${m.readOnly ? 'ro' : 'rw'}`)
     .sort()
     .join('|');
   return crypto.createHash('sha1').update(`${CONTAINER_SPEC_VERSION}|${payload}`).digest('hex').slice(0, 16);
@@ -184,10 +212,22 @@ function buildContainerEnv(params = {}) {
  * @param {string} params.workdir
  * @param {string} [params.network]
  * @param {number} [params.stopTimeoutSeconds]
+ * @param {string} [params.shmSize] - Size of /dev/shm (empty disables the flag).
+ * @param {string} [params.ulimitStack] - `soft:hard` stack limit (empty disables the flag).
  * @returns {string[]}
  */
 function buildCreateArgs(params = {}) {
   const { name, image, mounts = [], env = {}, labels = {}, workdir, network, stopTimeoutSeconds = 10 } = params;
+
+  const config = getSandboxConfig();
+  const shmSize = params.shmSize != null ? String(params.shmSize).trim() : config.shmSize;
+  // The stack limit is only passed to `podman create` when it is explicitly
+  // asked for: in rootless containers it makes the apt method crash with
+  // SIGSEGV, which would break the global setup. By default the limit is
+  // applied inside the command (see `execInContainer`).
+  const ulimitStack = params.ulimitStack != null
+    ? String(params.ulimitStack).trim()
+    : (config.ulimitStackCreate ? config.ulimitStack : '');
 
   const args = [
     'create',
@@ -199,6 +239,11 @@ function buildCreateArgs(params = {}) {
     '--cap-add', CONTAINER_CAPABILITIES.join(','),
     '--security-opt=no-new-privileges',
   ];
+
+  // /dev/shm defaults to 64 MB inside the container: too small for
+  // Chromium-based tools and for some Node workloads.
+  if (shmSize) args.push('--shm-size', shmSize);
+  if (ulimitStack) args.push('--ulimit', `stack=${ulimitStack}`);
 
   for (const [key, value] of Object.entries(labels)) {
     args.push('--label', `${key}=${value}`);
@@ -380,6 +425,216 @@ function runPodmanProcess(args, timeoutMs = 0) {
   });
 }
 
+// ── Output capture (file transport) ─────────────────────────────────────────
+
+/**
+ * Maximum size of the stdout/stderr read back from the container.
+ * The LLM context is truncated to 3000 chars anyway — this is only a guard
+ * against a runaway command filling the disk.
+ */
+const MAX_CAPTURE_BYTES = 256 * 1024;
+
+/** Suffix of the file the container writes the exit code into. */
+const CAPTURE_RC_SUFFIX = '.rc';
+/** Suffix of the file the container writes stdout into. */
+const CAPTURE_OUT_SUFFIX = '.out';
+/** Suffix of the file the container writes stderr into. */
+const CAPTURE_ERR_SUFFIX = '.err';
+/** Suffix of the sentinel file that proves the exchange directory is mounted. */
+const CAPTURE_PROBE_SUFFIX = '.probe';
+
+/** Diagnostics of the output transport (file / fallback / divergence). */
+const captureStats = { file: 0, fallback: 0, divergence: 0 };
+
+/** @type {number} Counter of the executions, so the capture ids never collide. */
+let captureCounter = 0;
+
+/**
+ * Identifier of a capture — unique per execution.
+ * @returns {string}
+ */
+function buildCaptureId() {
+  captureCounter += 1;
+  return `${process.pid}-${Date.now().toString(36)}-${captureCounter}`;
+}
+
+/**
+ * Reads a text file, or null when it does not exist.
+ * @param {string} filePath
+ * @returns {string|null}
+ */
+function readTextFile(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return null;
+    return fs.readFileSync(filePath, 'utf8');
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Reads the capture files of an execution.
+ * @param {string} ioDir
+ * @param {string} id
+ * @returns {{stdout: string|null, stderr: string|null, rc: string|null}}
+ */
+function readCaptureFiles(ioDir, id) {
+  return {
+    stdout: readTextFile(path.join(ioDir, `${id}${CAPTURE_OUT_SUFFIX}`)),
+    stderr: readTextFile(path.join(ioDir, `${id}${CAPTURE_ERR_SUFFIX}`)),
+    rc: readTextFile(path.join(ioDir, `${id}${CAPTURE_RC_SUFFIX}`)),
+  };
+}
+
+/**
+ * Removes the capture files of an execution (best effort).
+ * @param {string} ioDir
+ * @param {string} id
+ */
+function cleanupCaptureFiles(ioDir, id) {
+  if (!ioDir || !id) return;
+  for (const suffix of [CAPTURE_OUT_SUFFIX, CAPTURE_ERR_SUFFIX, CAPTURE_RC_SUFFIX, CAPTURE_PROBE_SUFFIX]) {
+    try {
+      fs.rmSync(path.join(ioDir, `${id}${suffix}`), { force: true });
+    } catch (_) {}
+  }
+}
+
+/**
+ * Truncates a captured stream to `MAX_CAPTURE_BYTES`.
+ * @param {string} value
+ * @returns {string}
+ */
+function truncateCapture(value) {
+  const buffer = Buffer.from(String(value == null ? '' : value), 'utf8');
+  if (buffer.length <= MAX_CAPTURE_BYTES) return buffer.toString('utf8');
+  return `${buffer.subarray(0, MAX_CAPTURE_BYTES).toString('utf8')}\n[truncated]`;
+}
+
+/**
+ * Builds the command that captures the output of the command into files.
+ *
+ * The command runs **once**: the `if` branch redirects stdout/stderr into the
+ * exchange directory and records the exit code; the `else` branch is the
+ * fallback used when the directory is not mounted (the output then comes
+ * through the exec stream).
+ *
+ * The `timeout` wrapper stays inside the redirected block, so the exit code
+ * file records `124` when the command runs out of time.
+ *
+ * @param {string} inner - The command to run (with the timeout wrapper).
+ * @param {Object} options
+ * @param {string} options.ioTarget - Mount point of the exchange inside the container.
+ * @param {string} options.id - Identifier of the execution.
+ * @returns {string}
+ */
+function buildCaptureCommand(inner, options = {}) {
+  const { ioTarget, id } = options;
+  if (!ioTarget || !id) return inner;
+
+  const probe = path.posix.join(ioTarget, `${id}${CAPTURE_PROBE_SUFFIX}`);
+  const out = path.posix.join(ioTarget, `${id}${CAPTURE_OUT_SUFFIX}`);
+  const err = path.posix.join(ioTarget, `${id}${CAPTURE_ERR_SUFFIX}`);
+  const rc = path.posix.join(ioTarget, `${id}${CAPTURE_RC_SUFFIX}`);
+
+  // The sentinel only exists on the host side: when the directory is not
+  // mounted the container cannot see it and falls back to the exec stream.
+  const quoted = shellQuote(inner);
+
+  return [
+    `if [ -f ${shellQuote(probe)} ]; then`,
+    `  sh -c ${quoted} > ${shellQuote(out)} 2> ${shellQuote(err)}`,
+    `  printf %s "$?" > ${shellQuote(rc)}`,
+    'else',
+    `  sh -c ${quoted}`,
+    'fi',
+  ].join('\n');
+}
+
+/**
+ * Resolves the result of a command from the capture files (authoritative) or
+ * from the exec stream (fallback).
+ *
+ * @param {Object} params
+ * @param {'file'|'stream'} [params.mode] - 'stream' ignores the capture files.
+ * @param {string} [params.ioDir]
+ * @param {string} [params.id]
+ * @param {{stdout?: string, stderr?: string, exitCode?: number}} [params.stream]
+ * @param {boolean} [params.timedOut] - The exec process was killed.
+ * @returns {{stdout: string, stderr: string, exitCode: number, failed: boolean, timedOut: boolean, captureSource: string}}
+ */
+function resolveCapturedResult(params = {}) {
+  const {
+    mode = 'file',
+    ioDir = null,
+    id = null,
+    stream = {},
+    timedOut: streamTimedOut = false,
+  } = params;
+
+  const streamStdout = String(stream.stdout || '');
+  const streamStderr = String(stream.stderr || '');
+  const streamExitCode = typeof stream.exitCode === 'number' ? stream.exitCode : 0;
+
+  let stdout = streamStdout;
+  let stderr = streamStderr;
+  let exitCode = streamExitCode;
+  let source = mode === 'stream' ? 'stream' : 'fallback';
+  let timedOut = Boolean(streamTimedOut) || streamExitCode === 124;
+
+  if (mode === 'file' && ioDir && id) {
+    const files = readCaptureFiles(ioDir, id);
+    const rc = files.rc != null ? String(files.rc).trim() : '';
+
+    if (rc !== '') {
+      // The capture files are authoritative.
+      const parsed = parseInt(rc, 10);
+      exitCode = Number.isFinite(parsed) ? parsed : 0;
+      stdout = files.stdout != null ? files.stdout : '';
+      stderr = files.stderr != null ? files.stderr : '';
+      source = 'file';
+      timedOut = timedOut || exitCode === 124;
+      captureStats.file += 1;
+      if (streamStdout.trim() !== '' || streamStderr.trim() !== '') {
+        captureStats.divergence += 1;
+      }
+    } else {
+      // No exit code file: the capture did not happen.
+      captureStats.fallback += 1;
+      stderr = [stderr, '[sandbox] output capture fell back to the exec stream'].filter(Boolean).join('\n');
+    }
+  }
+
+  if (process.env.MINIBOSS_DEBUG_PODMAN) {
+    console.error('[podmanExecutor] capture:', JSON.stringify({
+      source,
+      exitCode,
+      stdoutBytes: Buffer.byteLength(String(stdout)),
+      stderrBytes: Buffer.byteLength(String(stderr)),
+      streamBytes: Buffer.byteLength(streamStdout),
+      stats: captureStats,
+    }));
+  }
+
+  return {
+    stdout: truncateCapture(String(stdout).trim()),
+    stderr: truncateCapture(String(stderr).trim()),
+    exitCode,
+    failed: exitCode !== 0,
+    timedOut,
+    captureSource: source,
+  };
+}
+
+/**
+ * Diagnostics of the output transport.
+ * @returns {{file: number, fallback: number, divergence: number}}
+ */
+function getCaptureStats() {
+  return { ...captureStats };
+}
+
 // ── Container lifecycle ────────────────────────────────────────────────────
 
 /**
@@ -426,6 +681,8 @@ function inspectContainer(name) {
  * @param {Array<{path: string, writable: boolean}>} [params.extraPaths]
  * @param {Array<string>} [params.exportPaths]
  * @param {Array<string>} [params.configuredPaths]
+ * @param {string} [params.ioDir] - Host directory of the output exchange.
+ * @param {string} [params.ioTarget] - Mount point of the exchange inside the container.
  * @returns {Promise<{name: string, created: boolean, started: boolean, setupLog: string|null}>}
  */
 async function ensureContainer(params = {}) {
@@ -438,10 +695,12 @@ async function ensureContainer(params = {}) {
     extraPaths = [],
     exportPaths = [],
     configuredPaths = [],
+    ioDir = null,
+    ioTarget = config.ioMountTarget,
   } = params;
 
   const name = containerNameFor(conversationId);
-  const mounts = buildMountMap({ repoRoot, worktreePath, readOnlyWorktree, extraPaths });
+  const mounts = buildMountMap({ repoRoot, worktreePath, readOnlyWorktree, extraPaths, ioDir, ioTarget });
   const mountsKey = buildMountsKey(mounts);
 
   const env = buildContainerEnv({ exportPaths, configuredPaths });
@@ -500,14 +759,19 @@ async function ensureContainer(params = {}) {
     started = true;
   }
 
-  // Prepare the container HOME (the npm cache lives there) and detect the
-  // in-container timeout binary.
-  const prepared = await prepareContainer(name, env);
+  // Prepare the container HOME (the npm cache lives there), the output
+  // exchange directory and detect the in-container timeout binary.
+  const prepared = await prepareContainer(name, env, ioTarget);
 
-  // Run the repository setup script exactly once per container.
+  // Run the global setup script (CLI tools) and the repository setup script,
+  // each of them exactly once per container.
   let setupLog = null;
+  if (!prepared.globalSetupDone) {
+    setupLog = await runGlobalSetupScript(name);
+  }
   if (!prepared.setupDone) {
-    setupLog = await runSetupScript(name, worktreePath || repoRoot);
+    const repoSetupLog = await runSetupScript(name, worktreePath || repoRoot);
+    setupLog = [setupLog, repoSetupLog].filter(Boolean).join('\n');
   }
 
   containerStates.set(String(conversationId), {
@@ -516,6 +780,8 @@ async function ensureContainer(params = {}) {
     env,
     setupLog,
     timeoutBinary: prepared.timeoutBinary,
+    ioDir,
+    ioTarget,
   });
 
   lastActivity.set(name, Date.now());
@@ -524,32 +790,154 @@ async function ensureContainer(params = {}) {
 }
 
 /**
- * Prepares the container: creates the HOME directory and detects the
- * `timeout` binary used to enforce the command timeout inside the container.
+ * Prepares the container: creates the HOME directory, the output exchange
+ * directory and detects the `timeout` binary used to enforce the command
+ * timeout inside the container.
+ *
+ * @param {string} name
+ * @param {Object} env
+ * @param {string} [ioTarget] - Mount point of the output exchange.
  */
-async function prepareContainer(name, env) {
-  const command = `mkdir -p ${shellQuote(env.HOME)} && chmod 777 ${shellQuote(env.HOME)}; command -v timeout || true`;
+async function prepareContainer(name, env, ioTarget) {
+  const config = getSandboxConfig();
+  const parts = [`mkdir -p ${shellQuote(env.HOME)} && chmod 777 ${shellQuote(env.HOME)}`];
+  if (ioTarget) {
+    // The exchange directory is a mount point: the mkdir is a no-op when it is
+    // already there (and it creates the parent when the mount is missing).
+    parts.push(`mkdir -p ${shellQuote(ioTarget)}`);
+  }
+  parts.push('command -v timeout || true');
+
   // Runs as the container root: the container root is mapped to the host user
   // (keep-id), so the HOME directory belongs to the user and not to root.
-  const result = await runPodmanProcess(buildExecArgs({ name, env, command, user: 'root' }), 30000);
+  const result = await runPodmanProcess(buildExecArgs({ name, env, command: parts.join('; '), user: 'root' }), 30000);
   const output = `${result.stdout || ''}`.trim();
-  const setupDone = await isSetupDone(name);
+  const setupDone = await isSetupDone(name, config.setupMarkerPath);
+  const globalSetupDone = await isSetupDone(name, config.globalSetupMarkerPath);
   return {
     timeoutBinary: output && output.startsWith('/') ? output : null,
     setupDone,
+    globalSetupDone,
   };
 }
 
 /**
- * Whether the setup script already ran in this container.
+ * Whether a setup script already ran in this container.
+ * @param {string} name
+ * @param {string} markerPath
  */
-async function isSetupDone(name) {
-  const config = getSandboxConfig();
+async function isSetupDone(name, markerPath) {
   const result = runPodmanSync([
     'exec', name, '/bin/sh', '-c',
-    `test -f ${shellQuote(config.setupMarkerPath)} && echo yes || echo no`,
+    `test -f ${shellQuote(markerPath)} && echo yes || echo no`,
   ], { timeoutMs: 20000 });
   return String(result.stdout || '').trim() === 'yes';
+}
+
+/**
+ * Default content of the global setup script.
+ *
+ * The sandbox image (`node:22-bookworm`) does not ship the CLI tools the
+ * assistant often needs. The script installs them once per container, as
+ * root, and is a no-op when they are already there.
+ *
+ * Only the **generic** toolbox belongs here (it applies to every project):
+ *   - `jq`      — JSON processing;
+ *   - `ripgrep` — fast search (`grep` is slow on big repositories);
+ *   - `iproute2`— `ip`/`ss`, to diagnose ports and network.
+ *
+ * Anything project-specific (a database CLI, a linter, a language toolchain)
+ * belongs in the repository setup script (`<worktree>/.miniboss/setup.sh`),
+ * which runs right after this one.
+ */
+const DEFAULT_GLOBAL_SETUP_SCRIPT = [
+  '#!/bin/sh',
+  '# Global sandbox setup — runs once per container, as root.',
+  '# Only the tools that are useful in ANY project.',
+  'set -e',
+  'missing=""',
+  'for tool in jq rg ip; do',
+  '  command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"',
+  'done',
+  'if [ -z "$missing" ]; then',
+  '  exit 0',
+  'fi',
+  'export DEBIAN_FRONTEND=noninteractive',
+  'apt-get update -qq',
+  'apt-get install -y -qq --no-install-recommends jq ripgrep iproute2',
+  'rm -rf /var/lib/apt/lists/*',
+  '',
+].join('\n');
+
+/**
+ * Writes the default global setup script when it does not exist yet, so the
+ * user can edit it afterwards.
+ *
+ * @returns {string|null} The path of the script.
+ */
+function ensureGlobalSetupScript() {
+  const config = getSandboxConfig();
+  const scriptPath = config.globalSetupScript;
+  if (fs.existsSync(scriptPath)) return scriptPath;
+
+  try {
+    fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+    fs.writeFileSync(scriptPath, DEFAULT_GLOBAL_SETUP_SCRIPT, { mode: 0o755 });
+    console.log(`[podmanExecutor] Wrote the default global setup script to ${scriptPath}`);
+    return scriptPath;
+  } catch (err) {
+    console.warn(
+      `[podmanExecutor] Could not write the global setup script ${scriptPath}: ${err && err.message ? err.message : err}`
+    );
+    return null;
+  }
+}
+
+/**
+ * Runs the global setup script inside the container (once per container).
+ *
+ * The script is passed inline (base64) so no extra mount is needed and the
+ * stdin of `podman exec` stays untouched. A failing setup never breaks the
+ * container: the failure is logged and surfaced in the first `runCommand`.
+ *
+ * @param {string} name - Container name.
+ * @returns {Promise<string|null>}
+ */
+async function runGlobalSetupScript(name) {
+  const config = getSandboxConfig();
+  if (!config.globalSetupEnabled) return null;
+
+  // The default script is written on demand, so the setup also works when the
+  // server was not restarted after the feature was enabled.
+  ensureGlobalSetupScript();
+
+  const scriptPath = config.globalSetupScript;
+  if (!fs.existsSync(scriptPath)) {
+    console.warn(`[podmanExecutor] Global setup script not found: ${scriptPath}`);
+    return null;
+  }
+
+  const script = fs.readFileSync(scriptPath, 'utf8');
+  const encoded = Buffer.from(script, 'utf8').toString('base64');
+  const env = buildContainerEnv({});
+  const command = `printf %s ${shellQuote(encoded)} | base64 -d | sh`;
+
+  const result = await runPodmanProcess(buildExecArgs({ name, env, command, user: 'root' }), 10 * 60 * 1000);
+  const output = [
+    result.stdout ? String(result.stdout).trim() : '',
+    result.stderr ? String(result.stderr).trim() : '',
+  ].filter(Boolean).join('\n');
+
+  if (result.exitCode === 0) {
+    // Mark the setup as done so a restart does not run it again.
+    runPodmanSync([
+      'exec', name, '/bin/sh', '-c',
+      `mkdir -p ${shellQuote(path.dirname(config.globalSetupMarkerPath))} && touch ${shellQuote(config.globalSetupMarkerPath)}`,
+    ], { timeoutMs: 20000 });
+    return output ? `[setup:global] ${output}` : null;
+  }
+
+  return `[setup:global] FAILED (exit ${result.exitCode})\n${output}`;
 }
 
 /**
@@ -629,7 +1017,29 @@ function shellQuote(value) {
 }
 
 /**
+ * Raises the stack limit of a command inside the container.
+ *
+ * The default limit (8 MB) breaks deep recursion and some Node workloads.
+ * The limit is applied with the `ulimit` builtin instead of
+ * `podman create --ulimit stack=`, which makes the apt method crash with
+ * SIGSEGV in rootless containers.
+ *
+ * @param {string} command
+ * @param {string|null} [stackLimit] - Soft limit in KB (null disables it).
+ * @returns {string}
+ */
+function buildStackLimitedCommand(command, stackLimit) {
+  if (!stackLimit) return command;
+  return `ulimit -s ${stackLimit} 2>/dev/null || true; ${command}`;
+}
+
+/**
  * Executes a command inside the container.
+ *
+ * The output is transported through files: the command writes stdout, stderr
+ * and the exit code into the exchange directory (bind-mounted read-write) and
+ * the host reads them back. The stream of `podman exec` is only a fallback —
+ * it intermittently comes back empty, which left the assistant blind.
  *
  * @param {string} name - Container name.
  * @param {string} command
@@ -637,34 +1047,75 @@ function shellQuote(value) {
  * @param {number} timeoutMs
  * @param {Object} env
  * @param {string|null} [timeoutBinary] - Path of the `timeout` binary inside the container.
+ * @param {Object} [options]
+ * @param {string} [options.ioDir] - Host directory of the output exchange.
+ * @param {string} [options.ioTarget] - Mount point of the exchange inside the container.
+ * @param {'file'|'stream'} [options.captureMode] - 'stream' disables the file capture.
+ * @param {string} [options.stackLimit] - Soft stack limit (in KB) of the command.
  * @returns {Promise<{stdout: string, stderr: string, exitCode: number, failed: boolean}>}
  */
-async function execInContainer(name, command, cwd, timeoutMs, env, timeoutBinary) {
-  let inner = command;
+async function execInContainer(name, command, cwd, timeoutMs, env, timeoutBinary, options = {}) {
+  const {
+    ioDir = null,
+    ioTarget = null,
+    captureMode = 'file',
+    stackLimit = null,
+  } = options;
+
+  // The stack limit is raised inside the container: the default (8 MB) breaks
+  // deep recursion and some Node workloads. It is applied with the `ulimit`
+  // builtin instead of `podman create --ulimit`, which makes the apt method
+  // crash with SIGSEGV in rootless containers.
+  const prepared = buildStackLimitedCommand(command, stackLimit);
+
+  let inner = prepared;
   if (timeoutMs > 0 && timeoutBinary) {
     // The timeout is enforced INSIDE the container so the process is really killed.
     const seconds = Math.max(1, Math.ceil(timeoutMs / 1000));
-    inner = `${timeoutBinary} -k 5 ${seconds} /bin/sh -c ${shellQuote(command)}`;
+    inner = `${timeoutBinary} -k 5 ${seconds} /bin/sh -c ${shellQuote(prepared)}`;
   }
 
-  const args = buildExecArgs({ name, cwd, env, command: inner });
+  const useFileCapture = captureMode === 'file' && Boolean(ioDir && ioTarget);
+  const id = useFileCapture ? buildCaptureId() : null;
+
+  if (useFileCapture) {
+    // The sentinel proves to the container that the exchange directory is
+    // really mounted — otherwise the output would be redirected into the
+    // container's own filesystem and lost.
+    try {
+      fs.writeFileSync(path.join(ioDir, `${id}${CAPTURE_PROBE_SUFFIX}`), '', { mode: 0o600 });
+    } catch (err) {
+      console.warn(`[podmanExecutor] Could not create the capture sentinel: ${err && err.message ? err.message : err}`);
+    }
+  }
+
+  const effective = useFileCapture ? buildCaptureCommand(inner, { ioTarget, id }) : inner;
+
+  const args = buildExecArgs({ name, cwd, env, command: effective });
   const result = await runPodmanProcess(args, timeoutMs > 0 ? timeoutMs + 10000 : 0);
 
-  const stdout = String(result.stdout || '').trim();
-  const stderr = String(result.stderr || '').trim();
-
-  if (isContainerMissingError(stderr)) {
+  if (isContainerMissingError(String(result.stderr || ''))) {
     throw new Error(`Sandbox container ${name} is missing`);
   }
 
-  const timedOut = result.timedOut || result.exitCode === 124;
+  const resolved = resolveCapturedResult({
+    mode: useFileCapture ? 'file' : 'stream',
+    ioDir,
+    id,
+    stream: { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode },
+    timedOut: result.timedOut,
+  });
+
+  if (useFileCapture) cleanupCaptureFiles(ioDir, id);
+
+  const timedOut = resolved.timedOut;
   const timeoutMsg = timedOut ? `Command timed out after ${timeoutMs}ms` : '';
 
   return {
-    stdout,
-    stderr: [stderr, timeoutMsg].filter(Boolean).join('\n'),
-    exitCode: result.exitCode,
-    failed: result.exitCode !== 0,
+    stdout: resolved.stdout,
+    stderr: [resolved.stderr, timeoutMsg].filter(Boolean).join('\n'),
+    exitCode: resolved.exitCode,
+    failed: resolved.exitCode !== 0,
     timedOut,
   };
 }
@@ -688,6 +1139,7 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
     exportPaths = [],
     configuredPaths = [],
     conversationId,
+    captureMode = 'file',
   } = sandboxOpts;
 
   if (!repoRoot || !worktreePath) {
@@ -702,17 +1154,27 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
     throw new Error(`[podmanExecutor] cwd "${resolvedCwd}" is outside worktree "${resolvedWorktreePath}"`);
   }
 
+  const containerId = conversationId != null ? conversationId : `cwd-${resolvedCwd}`;
+  const config = getSandboxConfig();
+  // The exchange directory is per conversation: the container is per
+  // conversation too, so the mount point is stable.
+  const ioDir = getSandboxIoDir(getSandboxIoKey(conversationId, resolvedCwd));
+  const ioTarget = config.ioMountTarget;
+  const stackLimit = getSandboxStackLimit(config);
+
   const { name, setupLog } = await ensureContainer({
-    conversationId: conversationId != null ? conversationId : `cwd-${resolvedCwd}`,
+    conversationId: containerId,
     repoRoot,
     worktreePath: resolvedWorktreePath,
     readOnlyWorktree,
     extraPaths,
     exportPaths,
     configuredPaths,
+    ioDir,
+    ioTarget,
   });
 
-  const state = containerStates.get(String(conversationId != null ? conversationId : `cwd-${resolvedCwd}`));
+  const state = containerStates.get(String(containerId));
   const env = state?.env || buildContainerEnv({ exportPaths, configuredPaths });
 
   console.log('[podmanExecutor] Running command in sandbox', {
@@ -727,7 +1189,13 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
     resolvedCwd,
     timeoutMs,
     env,
-    state?.timeoutBinary || null
+    state?.timeoutBinary || null,
+    {
+      ioDir: state?.ioDir || ioDir,
+      ioTarget: state?.ioTarget || ioTarget,
+      captureMode,
+      stackLimit,
+    }
   );
 
   lastActivity.set(name, Date.now());
@@ -823,6 +1291,26 @@ function stopIdleContainers(idleTtlMs) {
 }
 
 /**
+ * Removes the output exchange directory of a conversation.
+ * @param {number|string} conversationId
+ * @returns {boolean}
+ */
+function removeIoDir(conversationId) {
+  if (conversationId == null) return false;
+  const config = getSandboxConfig();
+  const key = getSandboxIoKey(conversationId);
+  const dir = path.join(config.ioDir, key);
+  try {
+    if (!fs.existsSync(dir)) return false;
+    fs.rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch (err) {
+    console.warn(`[podmanExecutor] Could not remove the sandbox I/O directory ${dir}: ${err && err.message ? err.message : err}`);
+    return false;
+  }
+}
+
+/**
  * Removes the containers whose conversation no longer exists or whose worktree
  * is gone. Containers without the `miniboss=true` label are never touched.
  *
@@ -845,6 +1333,7 @@ function removeOrphanContainers(conversationExists) {
     if (result.exitCode === 0) {
       console.log(`[podmanExecutor] Removed orphan container ${container.name}`);
       removed.push(container.name);
+      if (conversationGone && conversationId) removeIoDir(conversationId);
     }
   }
 
@@ -861,26 +1350,38 @@ function removeContainerForConversation(conversationId) {
   const result = runPodmanSync(['rm', '-f', name], { timeoutMs: 60000 });
   containerStates.delete(String(conversationId));
   lastActivity.delete(name);
+  removeIoDir(conversationId);
   return result.exitCode === 0;
 }
 
 module.exports = {
   CONTAINER_SPEC_VERSION,
   CONTAINER_CAPABILITIES,
+  DEFAULT_GLOBAL_SETUP_SCRIPT,
+  MAX_CAPTURE_BYTES,
   buildMountMap,
   buildMountsKey,
   buildContainerEnv,
   buildCreateArgs,
   buildExecArgs,
+  buildCaptureCommand,
+  buildCaptureId,
+  buildStackLimitedCommand,
+  resolveCapturedResult,
+  getCaptureStats,
   containerNameFor,
   inspectContainer,
   ensureContainer,
+  prepareContainer,
   execInContainer,
   runPodmanCommand,
+  ensureGlobalSetupScript,
+  runGlobalSetupScript,
   listMiniBossContainers,
   stopIdleContainers,
   removeOrphanContainers,
   removeContainerForConversation,
+  removeIoDir,
   isImageMissingError,
   isContainerMissingError,
   hasNewuidmap,

@@ -133,6 +133,16 @@ async function checkSandboxRuntime() {
   }
 
   console.log(`[Startup] Sandbox runtime: podman (${binary}) — image ${config.image}`);
+
+  // The global setup script (CLI tools missing from the image) is written on
+  // startup when it does not exist yet, so the user can edit it afterwards.
+  try {
+    const { ensureGlobalSetupScript } = require('./podmanExecutor');
+    ensureGlobalSetupScript();
+  } catch (err) {
+    console.warn('[Startup] Could not prepare the global sandbox setup script:', err?.message || err);
+  }
+
   return { runtime: 'podman', image: config.image, ready: true };
 }
 

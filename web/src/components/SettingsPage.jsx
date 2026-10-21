@@ -640,7 +640,7 @@ export default function SettingsPage({ onClose }) {
               value={newPathInput}
               onChange={(e) => setNewPathInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') handleAddSandboxPath(); }}
-              placeholder="/home/user/.nvm"
+              placeholder="/home/user/project-data"
               fullWidth
               size="small"
             />
@@ -751,11 +751,11 @@ export default function SettingsPage({ onClose }) {
           <Typography variant="subtitle1" sx={{ mb: 1 }}>Tips</Typography>
           <Typography variant="body2" color="text.secondary" component="div">
             <ul style={{ margin: 0, paddingLeft: 20 }}>
-              <li>Add <code>~/.nvm</code> (read) so the sandbox can access nvm-managed toolchains.</li>
-              <li>To run a tool by name (e.g. <code>node</code>, <code>deno</code>), add its <strong>bin directory</strong> and check <strong>Export to PATH</strong> (e.g. <code>~/.nvm/versions/node/vXX/bin</code>, <code>~/.deno/bin</code>).</li>
+              <li>The container brings its own <code>node</code>, <code>npm</code> and <code>git</code> — and its own npm cache (<code>/home/miniboss/.npm</code>). Nothing needs to be shared for them to work.</li>
+              <li>Share only what the project needs (a data folder, a toolchain), and prefer <strong>Read</strong>.</li>
+              <li>Do <strong>not</strong> share <code>~/.npm</code> (12 GB, and the container owns its own cache) nor <code>~/.nvm</code> (it brings Node versions that conflict with the one of the container).</li>
+              <li>To run a tool by name (e.g. <code>deno</code>), add its <strong>bin directory</strong> and check <strong>Export to PATH</strong> (e.g. <code>~/.deno/bin</code>).</li>
               <li>Exporting to PATH overrides the inherited PATH: unchecking removes that folder from the sandbox PATH.</li>
-              <li>Add <code>~/.npm</code> (write) to allow npm to cache packages.</li>
-              <li>Add <code>~/.cache</code> (write) for tools that need a writable cache directory.</li>
               <li>Paths that don't exist are skipped automatically.</li>
             </ul>
           </Typography>
