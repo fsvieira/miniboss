@@ -100,6 +100,12 @@ function runTests() {
     assert.notStrictEqual(rw, ro, 'the container must be recreated when the worktree becomes read-only');
   });
 
+  check('the mount key changes when the container spec changes', () => {
+    const key = buildMountsKey(buildMountMap({ repoRoot, worktreePath }));
+    assert.ok(key.length > 0);
+    assert.ok(/^[0-9a-f]+$/.test(key), 'the key must be safe to store in a podman label');
+  });
+
   // ── Environment allowlist (D7) ──────────────────────────────────────────
 
   check('the container env is an explicit allowlist', () => {

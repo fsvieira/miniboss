@@ -60,6 +60,13 @@ const CONTAINER_CAPABILITIES = [
  */
 const INIT_COMMAND = 'trap "kill -TERM 0" TERM INT; sleep infinity & wait';
 
+/**
+ * Version of the container specification (capabilities, exec user, init command…).
+ * It is part of the container identity: when it changes, the containers created
+ * by an older version of MiniBoss are recreated instead of being reused.
+ */
+const CONTAINER_SPEC_VERSION = '2';
+
 /** @type {Map<string, Object>} conversationId -> container state */
 const containerStates = new Map();
 
@@ -129,7 +136,7 @@ function buildMountsKey(mounts) {
     .map(m => `${m.source}:${m.readOnly ? 'ro' : 'rw'}`)
     .sort()
     .join('|');
-  return crypto.createHash('sha1').update(payload).digest('hex').slice(0, 16);
+  return crypto.createHash('sha1').update(`${CONTAINER_SPEC_VERSION}|${payload}`).digest('hex').slice(0, 16);
 }
 
 /**
@@ -858,6 +865,8 @@ function removeContainerForConversation(conversationId) {
 }
 
 module.exports = {
+  CONTAINER_SPEC_VERSION,
+  CONTAINER_CAPABILITIES,
   buildMountMap,
   buildMountsKey,
   buildContainerEnv,
