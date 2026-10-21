@@ -2088,19 +2088,37 @@ class DatabaseAPI {
 
   /**
    * Records the token usage of an AI call. Never deleted by clear.
-   * @param {Object} data - { conversation_id, model, prompt_tokens, completion_tokens, cost_usd? }
+   *
+   * `cost_usd` is NULL when the model price is unknown — an unpriced call must never
+   * be confused with a call that cost zero.
+   *
+   * @param {Object} data - {
+   *   conversation_id, model, requested_model, response_model,
+   *   prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
+   *   cost_usd, pricing_source, provider_id
+   * }
    */
   recordTokenUsage(data) {
     const stmt = this.connection.prepare(`
-      INSERT INTO conversation_token_usage (conversation_id, model, prompt_tokens, completion_tokens, cost_usd, created_at)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      INSERT INTO conversation_token_usage (
+        conversation_id, model, requested_model, response_model,
+        prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
+        cost_usd, pricing_source, provider_id, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     `);
     const result = stmt.run(
       data.conversation_id,
       data.model || null,
+      data.requested_model || null,
+      data.response_model || null,
       Number(data.prompt_tokens) || 0,
       Number(data.completion_tokens) || 0,
-      data.cost_usd != null ? Number(data.cost_usd) : null
+      Number(data.cache_read_tokens) || 0,
+      Number(data.cache_write_tokens) || 0,
+      data.cost_usd != null ? Number(data.cost_usd) : null,
+      data.pricing_source || null,
+      data.provider_id != null ? Number(data.provider_id) : null
     );
     return result.lastInsertRowid;
   }
@@ -2129,13 +2147,35 @@ class DatabaseAPI {
    * Total de uso de tokens de uma conversa incluindo descendentes.
    * For MAIN it gives the global total (delegated work included); for a focus,
    * gives the total of its own subtree.
+   *
+   * The aggregate never lies: calls without a known price are counted separately
+   * (`unpriced_calls`) and the caller can tell a complete total from a partial one
+   * through `coverage`.
+   *
    * @param {number} conversationId
-   * @returns {Object} { total_prompt_tokens, total_completion_tokens, total_tokens, total_cost_usd, call_count, models }
+   * @param {{strict?: boolean}} [options] - When `strict` is true, `total_cost_usd`
+   *        is null if any call of the subtree is unpriced.
+   * @returns {Object} {
+   *   total_prompt_tokens, total_completion_tokens, total_tokens, total_cost_usd,
+   *   priced_calls, unpriced_calls, coverage, call_count, models, partial
+   * }
    */
-  getConversationTokenUsage(conversationId) {
+  getConversationTokenUsage(conversationId, options = {}) {
+    const strict = options.strict === true;
     const subtreeIds = this.getConversationSubtreeIds(conversationId);
     if (subtreeIds.length === 0) {
-      return { total_prompt_tokens: 0, total_completion_tokens: 0, total_tokens: 0, total_cost_usd: null, call_count: 0, models: [] };
+      return {
+        total_prompt_tokens: 0,
+        total_completion_tokens: 0,
+        total_tokens: 0,
+        total_cost_usd: null,
+        priced_calls: 0,
+        unpriced_calls: 0,
+        coverage: 1,
+        call_count: 0,
+        models: [],
+        partial: false,
+      };
     }
     const placeholders = subtreeIds.map(() => '?').join(',');
     const row = this.connection.prepare(`
@@ -2144,10 +2184,17 @@ class DatabaseAPI {
         COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens,
         COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total_tokens,
         SUM(cost_usd) AS total_cost_usd,
-        COUNT(*) AS call_count
+        COUNT(*) AS call_count,
+        COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS unpriced_calls
       FROM conversation_token_usage
       WHERE conversation_id IN (${placeholders})
     `).get(...subtreeIds);
+
+    const callCount = Number(row?.call_count) || 0;
+    const unpricedCalls = Number(row?.unpriced_calls) || 0;
+    const pricedCalls = Math.max(0, callCount - unpricedCalls);
+    const coverage = callCount === 0 ? 1 : pricedCalls / callCount;
+    const partial = unpricedCalls > 0;
 
     const models = this.connection.prepare(`
       SELECT DISTINCT model FROM conversation_token_usage
@@ -2155,14 +2202,61 @@ class DatabaseAPI {
       ORDER BY model
     `).all(...subtreeIds).map(r => r.model);
 
+    let totalCostUsd = row?.total_cost_usd != null ? Number(row.total_cost_usd) : null;
+    if (partial && strict) {
+      // A partial total must not be presented as the real spend.
+      totalCostUsd = null;
+    }
+
     return {
       total_prompt_tokens: Number(row?.total_prompt_tokens) || 0,
       total_completion_tokens: Number(row?.total_completion_tokens) || 0,
       total_tokens: Number(row?.total_tokens) || 0,
-      total_cost_usd: row?.total_cost_usd != null ? Number(row.total_cost_usd) : null,
-      call_count: Number(row?.call_count) || 0,
+      total_cost_usd: totalCostUsd,
+      priced_calls: pricedCalls,
+      unpriced_calls: unpricedCalls,
+      coverage,
+      call_count: callCount,
       models,
+      partial,
     };
+  }
+
+  /**
+   * Per-model breakdown of the token usage of a conversation (and its descendants).
+   * Used by the UI to explain where the money went.
+   *
+   * @param {number} conversationId
+   * @returns {Array<{model: string, prompt_tokens: number, completion_tokens: number, total_tokens: number, cost_usd: number|null, calls: number, unpriced_calls: number}>}
+   */
+  getConversationTokenUsageByModel(conversationId) {
+    const subtreeIds = this.getConversationSubtreeIds(conversationId);
+    if (subtreeIds.length === 0) return [];
+    const placeholders = subtreeIds.map(() => '?').join(',');
+    const rows = this.connection.prepare(`
+      SELECT
+        COALESCE(NULLIF(model, ''), '(unknown)') AS model,
+        COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+        COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+        COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total_tokens,
+        SUM(cost_usd) AS cost_usd,
+        COUNT(*) AS calls,
+        COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS unpriced_calls
+      FROM conversation_token_usage
+      WHERE conversation_id IN (${placeholders})
+      GROUP BY COALESCE(NULLIF(model, ''), '(unknown)')
+      ORDER BY model
+    `).all(...subtreeIds);
+
+    return rows.map(row => ({
+      model: row.model,
+      prompt_tokens: Number(row.prompt_tokens) || 0,
+      completion_tokens: Number(row.completion_tokens) || 0,
+      total_tokens: Number(row.total_tokens) || 0,
+      cost_usd: row.cost_usd != null ? Number(row.cost_usd) : null,
+      calls: Number(row.calls) || 0,
+      unpriced_calls: Number(row.unpriced_calls) || 0,
+    }));
   }
 
   // =====================================================================

@@ -12,7 +12,7 @@ const STATIC_PROTOCOL_PROMPT = [
   'You operate within a git repository. All file operations affect the current worktree.',
   'Use investigate to delegate read-only analysis to isolated sub-agents. Wait for their reports.',
   'You are NOT a chat assistant — you are a development agent. Prefer tool calls over text explanations.',
-  'Shell commands from runCommand execute in a sandboxed worktree. CWD = conversation worktree. Outside the worktree, only read access to selected system folders. /home is not accessible. Commands run via bubblewrap (bwrap).',
+  'Shell commands from runCommand execute in a sandboxed worktree. CWD = conversation worktree. Outside the worktree, only read access to selected system folders. /home is not accessible. Commands run inside an isolated sandbox container.',
 ].join('\n');
 
 function truncateText(value, maxLength) {

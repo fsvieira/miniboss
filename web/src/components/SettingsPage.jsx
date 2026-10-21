@@ -32,6 +32,7 @@ import {
   deleteProvider,
   getCurrentProviderId,
   setCurrentProviderId,
+  refreshProviderPricing,
 } from '../api/providers';
 import { fetchModels } from '../api/ai';
 import { getSetting, setSetting } from '../api/settings';
@@ -71,6 +72,8 @@ export default function SettingsPage({ onClose }) {
   const [autoSummarizeThreshold, setAutoSummarizeThreshold] = useState(0);
   const [autoSummarizeEnabled, setAutoSummarizeEnabled] = useState(false);
   const [agentSystemPrompt, setAgentSystemPrompt] = useState('');
+  const [allowPaidModels, setAllowPaidModels] = useState(false);
+  const [sandboxImage, setSandboxImage] = useState('');
 
   // Sandbox state
   const [sandboxPaths, setSandboxPaths] = useState([]);
@@ -95,11 +98,13 @@ export default function SettingsPage({ onClose }) {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [providersData, currentId, thresholdValue, agentSystemPromptValue] = await Promise.all([
+      const [providersData, currentId, thresholdValue, agentSystemPromptValue, allowPaidValue, sandboxImageValue] = await Promise.all([
         getProviders(),
         getCurrentProviderId(),
         getSetting('auto_summarize_threshold'),
-        getSetting('agent_system_prompt')
+        getSetting('agent_system_prompt'),
+        getSetting('allow_paid_models').catch(() => null),
+        getSetting('sandbox_image').catch(() => null),
       ]);
       const defaultModelValue = (await getSetting('default_model').catch(() => null)) || 'gpt-3.5-turbo';
       const defaultThinkingValue = (await getSetting('default_thinking_mode').catch(() => null)) || '';
@@ -112,6 +117,8 @@ export default function SettingsPage({ onClose }) {
       setAutoSummarizeThreshold(threshold);
       setAutoSummarizeEnabled(threshold > 0);
       setAgentSystemPrompt(typeof agentSystemPromptValue === 'string' ? agentSystemPromptValue : '');
+      setAllowPaidModels(String(allowPaidValue) === 'true' || allowPaidValue === '1');
+      setSandboxImage(typeof sandboxImageValue === 'string' ? sandboxImageValue : '');
     } catch (error) {
       console.error('Error loading settings:', error);
     }
@@ -175,8 +182,20 @@ export default function SettingsPage({ onClose }) {
     }
   };
 
-  const handleFetchModels = async () => {
-    if (!selectedProviderForModels) return;
+  const handleRefreshPricing = async (provider) => {
+    try {
+      const result = await refreshProviderPricing(provider.id);
+      setToast({
+        message: `Pricing actualizado (${result.models} modelos).`,
+        severity: 'success'
+      });
+    } catch (error) {
+      console.error('Error refreshing pricing:', error);
+      setToast({ message: 'Failed to refresh pricing: ' + error.message, severity: 'error' });
+    }
+  };
+
+  const handleFetchModels = async () => {    if (!selectedProviderForModels) return;
     const provider = providers.find(p => p.id.toString() === selectedProviderForModels);
     if (!provider) return;
     setLoadingModels(true);
@@ -205,12 +224,39 @@ export default function SettingsPage({ onClose }) {
     setAutoSummarizeThreshold(newValue);
   };
 
+  const handleSaveSandboxImage = async () => {
+    try {
+      await setSetting('sandbox_image', sandboxImage.trim());
+      setToast({ message: 'Sandbox image guardado!', severity: 'success' });
+    } catch (error) {
+      console.error('Error saving sandbox_image:', error);
+      setToast({ message: 'Failed to save: ' + error.message, severity: 'error' });
+    }
+  };
+
   const handleAutoSummarizeEnabledChange = async (event) => {
     const enabled = event.target.checked;
     setAutoSummarizeEnabled(enabled);
     if (!enabled) {
       setAutoSummarizeThreshold(0);
       await setSetting('auto_summarize_threshold', '0');
+    }
+  };
+
+  const handleTogglePaidModels = async (event) => {    const enabled = event.target.checked;
+    setAllowPaidModels(enabled);
+    try {
+      await setSetting('allow_paid_models', enabled ? 'true' : 'false');
+      setToast({
+        message: enabled
+          ? 'Modelos pagos liberados — o custo passa a ser contabilizado.'
+          : 'Modelos pagos bloqueados.',
+        severity: 'success'
+      });
+    } catch (error) {
+      console.error('Error setting allow_paid_models:', error);
+      setAllowPaidModels(!enabled);
+      setToast({ message: 'Failed to save: ' + error.message, severity: 'error' });
     }
   };
 
@@ -385,6 +431,13 @@ export default function SettingsPage({ onClose }) {
                     secondary={`${provider.base_url}${provider.is_active ? ' (Active)' : ''}`}
                   />
                   <ListItemSecondaryAction>
+                    <Button
+                      size="small"
+                      onClick={() => handleRefreshPricing(provider)}
+                      sx={{ mr: 1 }}
+                    >
+                      Pricing
+                    </Button>
                     <IconButton onClick={() => handleEditProvider(provider)}>
                       <Edit />
                     </IconButton>
@@ -483,6 +536,22 @@ export default function SettingsPage({ onClose }) {
               <Button onClick={handleSetDefaultModel} variant="contained" sx={{ mt: 1 }}>
                 Set as Default
               </Button>
+
+              <Divider sx={{ my: 2 }} />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={allowPaidModels}
+                    onChange={handleTogglePaidModels}
+                  />
+                }
+                label="Allow paid models"
+              />
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                While disabled, models with a known positive price are hidden and rejected by the server.
+                Enable it only after <code>node server/scripts/costAudit.js</code> passes and the cost
+                reported by MiniBoss matches the provider dashboard.
+              </Typography>
             </>
           ) : null}
         </TabPanel>
@@ -656,6 +725,26 @@ export default function SettingsPage({ onClose }) {
               ))}
             </List>
           )}
+
+          <Divider sx={{ my: 3 }} />
+
+          <Typography variant="subtitle1" sx={{ mb: 1 }}>Container image</Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+            The image used by the Podman sandbox. It must provide node, npm and git.
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+            <TextField
+              label="Sandbox image"
+              value={sandboxImage}
+              onChange={(e) => setSandboxImage(e.target.value)}
+              fullWidth
+              size="small"
+              placeholder="docker.io/library/node:22-bookworm"
+            />
+            <Button variant="outlined" onClick={handleSaveSandboxImage} sx={{ whiteSpace: 'nowrap' }}>
+              Save
+            </Button>
+          </Box>
 
           <Divider sx={{ my: 3 }} />
 

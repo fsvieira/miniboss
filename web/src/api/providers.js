@@ -43,6 +43,19 @@ export async function activateProvider(id) {
   return response.json();
 }
 
+export async function refreshProviderPricing(id) {
+  const response = await fetch(`${API_URL}/providers/${id}/refresh-pricing`, { method: 'POST' });
+  if (!response.ok) {
+    let message = 'Failed to refresh pricing';
+    try {
+      const body = await response.json();
+      if (body?.error) message = body.error;
+    } catch (_) {}
+    throw new Error(message);
+  }
+  return response.json();
+}
+
 // --- UI convenience helpers (moved from legacy aiService.js) ---
 
 export async function setCurrentProviderId(id) {

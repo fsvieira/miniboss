@@ -782,6 +782,46 @@ class ConversationManager {
 
         const targetModel = conv.model || this.db.getSetting('default_model') || 'gpt-3.5-turbo';
 
+        // Paid-model gate (A12). A blocked model must not reach the provider.
+        try {
+            const { checkPaidModelGate } = require('./ai/pricing');
+            const gate = checkPaidModelGate(targetModel);
+            if (!gate.allowed) {
+                console.warn(`[ConversationManager] ${gate.reason}`);
+                this.db.updateConversationState(conv.id, {
+                    processing_state: 'idle',
+                    phase: 'error',
+                });
+                this.stateChange(conv, {
+                    conversation_id: conv.id,
+                    role: 'assistant',
+                    content: `Error: ${gate.reason}`,
+                    raw_response: JSON.stringify({ error: true, finish_reason: 'error', message: gate.reason }),
+                    status: 'completed',
+                });
+                this.socketService.broadcastStreamDone(conv.id);
+                return;
+            }
+        } catch (gateErr) {
+            console.error('[ConversationManager] Paid-model gate check failed:', gateErr);
+        }
+
+        // Keep the pricing catalog fresh before the call (A3). A refresh failure never
+        // blocks the AI call: the last known catalog is used and the cost is flagged stale.
+        let pricingCatalogStale = false;
+        try {
+            const { ensureModelPricing } = require('./ai/pricing');
+            const { stale } = await ensureModelPricing({
+                provider,
+                providerId: provider.id,
+                model: targetModel,
+            });
+            pricingCatalogStale = stale === true;
+        } catch (pricingErr) {
+            console.warn('[ConversationManager] Pricing catalog refresh failed:', pricingErr?.message || pricingErr);
+            pricingCatalogStale = true;
+        }
+
         const { sendToAI } = require('../controllers/systemPromptBuilder');
 
         const messages = this.db.getMessagesByConversation(conv.id, { limit: 1000 });
@@ -863,24 +903,20 @@ class ConversationManager {
             return;
         }
 
-        // Persist token usage (Phase D) — survives truncation/cleanup
+        // Persist token usage (Phase D) — survives truncation/cleanup.
+        // Single recorder (services/ai/usageRecorder) so every provider call is audited.
         try {
             const usage = result && result.usage;
             if (usage && (usage.promptTokens != null || usage.completionTokens != null)) {
-                const promptTokens = Number(usage.promptTokens) || 0;
-                const completionTokens = Number(usage.completionTokens) || 0;
-                let costUsd = null;
-                try {
-                    const { getModelPricing, computeCostUsd } = require('./ai/pricing');
-                    const pricing = getModelPricing(targetModel);
-                    costUsd = computeCostUsd(promptTokens, completionTokens, pricing);
-                } catch (_) {}
-                this.db.recordTokenUsage({
-                    conversation_id: conv.id,
-                    model: targetModel,
-                    prompt_tokens: promptTokens,
-                    completion_tokens: completionTokens,
-                    cost_usd: costUsd,
+                const { recordUsage } = require('./ai/usageRecorder');
+                recordUsage({
+                    db: this.db,
+                    conversationId: conv.id,
+                    requestedModel: targetModel,
+                    responseModel: result.responseModel || null,
+                    usage,
+                    providerId: provider.id || null,
+                    pricingSource: pricingCatalogStale ? 'stale' : null,
                 });
             }
         } catch (usageErr) {

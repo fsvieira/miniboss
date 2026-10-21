@@ -2,7 +2,7 @@
 
 const { MESSAGE_STATES, FINAL_MESSAGE_STATES, PROCESSING_STATES } = require('../constants/processingStates');
 const { executeTool } = require('../tools');
-const { runShellCommand } = require('./shellExecutor');
+const { runSandboxCommand } = require('./sandbox');
 const { safeSerializeToolResult } = require('../controllers/toolUtils');
 const { createTaskTreeTools } = require('../tools/taskTreeTools');
 const path = require('path');
@@ -262,10 +262,13 @@ class ToolProcessor {
   /**
    * Special handler for runCommand.
    *
-   * runCommand always executes inside the sandbox (bubblewrap). There is no
-   * approval / auto-approval flow anymore: the worktree is mounted read-only
-   * for plan mode and for focus/subbot/project conversations, and extra access
-   * is controlled by the configured sandbox paths.
+   * runCommand always executes inside the sandbox. There is no approval /
+   * auto-approval flow anymore: the worktree is mounted read-only for plan
+   * mode and for focus/subbot/project conversations, and extra access is
+   * controlled by the configured sandbox paths.
+   *
+   * The sandbox runtime (podman or bwrap) is chosen by the SANDBOX_RUNTIME
+   * environment variable — see services/sandbox.
    */
   async _handleRunCommand(toolMsg, toolArgs, workingDir, conversationId) {
     const command = toolArgs.command || '';
@@ -283,6 +286,11 @@ class ToolProcessor {
       worktreePath: worktreePath || repoRoot,
       readOnlyWorktree: conv && ['focus', 'subbot', 'project'].includes(conv.conversation_type) || conv?.mode === 'plan',
       extraPaths: this._getSandboxExtraPaths(),
+      exportPaths: this._getExportToPathPaths(),
+      configuredPaths: this._getConfiguredSandboxPaths(),
+      conversationId,
+      // Only used by the bwrap runtime; the podman runtime builds its own
+      // allowlisted environment (no host env leakage).
       env: this._buildRunEnv()
     };
 
@@ -300,7 +308,7 @@ class ToolProcessor {
     let result;
     try {
       result = await Promise.race([
-        runShellCommand(command, cwd, timeout, sandboxOpts),
+        runSandboxCommand(command, cwd, timeout, sandboxOpts),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error('Command timeout (outer)')), maxTimeout)
         )

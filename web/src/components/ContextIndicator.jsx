@@ -10,8 +10,16 @@ function formatTokens(num) {
   return num.toString();
 }
 
-function formatCost(cost) {
-  if (cost == null) return null;
+function formatCost(cost, partial = false) {
+  if (cost == null) return '—';
+  const prefix = partial ? '≈ ' : '';
+  if (cost >= 0.01) return prefix + '$' + cost.toFixed(2);
+  if (cost >= 0.0001) return prefix + '$' + cost.toFixed(4);
+  return prefix + '$' + cost.toFixed(6);
+}
+
+function formatModelCost(cost) {
+  if (cost == null) return '—';
   if (cost >= 0.01) return '$' + cost.toFixed(2);
   if (cost >= 0.0001) return '$' + cost.toFixed(4);
   return '$' + cost.toFixed(6);
@@ -27,7 +35,7 @@ export default function ContextIndicator({
 }) {
   if (!contextInfo) return null;
 
-  const { input_tokens, token_limit, percentage = 0, model, provider_name, compressed_tokens, total_tokens, total_cost, models, question_count, subbot_count, focus_level, thinking_mode } = contextInfo;
+  const { input_tokens, token_limit, percentage = 0, model, provider_name, compressed_tokens, total_tokens, total_cost, models, question_count, subbot_count, focus_level, thinking_mode, models_breakdown, cost_coverage, unpriced_calls, cost_partial } = contextInfo;
 
   const getColor = (pct) => {
     if (pct >= 90) return 'error';
@@ -35,7 +43,11 @@ export default function ContextIndicator({
     return 'success';
   };
 
-  const costText = formatCost(total_cost);
+  const isPartial = cost_partial === true || (cost_coverage != null && cost_coverage < 1);
+  // A null cost means "unknown", not "free": it is only rendered when there is
+  // actually something to report (a partial total or a priced call).
+  const showCost = total_cost != null || isPartial;
+  const costText = showCost ? formatCost(total_cost, isPartial) : null;
   const thinkingLabel = thinking_mode ? thinkingModeLabel(thinking_mode) : null;
   const modelLabel = thinkingLabel
     ? (provider_name ? `${provider_name}: ${model}` : model) + ` · ${thinkingLabel}`
@@ -45,11 +57,19 @@ export default function ContextIndicator({
     model ? `Modelo: ${model}` : null,
     thinkingLabel ? `Thinking: ${thinkingLabel}` : null,
   ].filter(Boolean).join(' • ');
+  const breakdown = Array.isArray(models_breakdown) ? models_breakdown : [];
+  const breakdownLines = breakdown.map(entry => {
+    const unpriced = entry.unpriced_calls > 0 ? ` (${entry.unpriced_calls} sem preço)` : '';
+    return `${entry.model}: ${formatModelCost(entry.cost_usd)}${unpriced} · ${entry.calls} chamada(s)`;
+  });
   const metricsTooltip = [
     models && models.length ? `Modelos: ${models.join(', ')}` : null,
     question_count != null ? `Perguntas: ${question_count}` : null,
-    subbot_count != null ? `Sub-investigations: ${subbot_count}` : null,
+    subbot_count != null ? `Sub-investigações: ${subbot_count}` : null,
     focus_level != null && focus_level > 0 ? `Focus level: ${focus_level}` : null,
+    isPartial && unpriced_calls ? `${unpriced_calls} chamada(s) sem preço — total parcial` : null,
+    breakdownLines.length ? '' : null,
+    ...breakdownLines,
   ].filter(Boolean).join(' • ');
 
   return (

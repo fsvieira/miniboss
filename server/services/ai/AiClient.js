@@ -1,4 +1,5 @@
 const OpenAI = require('openai');
+const { normalizePricingBlock } = require('./priceCatalog');
 
 /**
  * Transport client for communication with AI providers (OpenAI-compatible).
@@ -88,6 +89,9 @@ class AiClient {
       messages,
       max_tokens: maxTokens || 8192,
       stream: true, // Habilitar streaming
+      // Some providers only report usage when this is set. Kilo reports it in the
+      // finish_reason chunk regardless, so this is additive, not a replacement.
+      stream_options: { include_usage: true },
     };
 
     if (tools && tools.length > 0) {
@@ -98,9 +102,22 @@ class AiClient {
     this._applyReasoningToRequest(requestParams, reasoning);
 
     try {
-      const stream = await this.openai.chat.completions.create(requestParams, {
-        signal
-      });
+      let stream;
+      try {
+        stream = await this.openai.chat.completions.create(requestParams, {
+          signal
+        });
+      } catch (error) {
+        // Strict providers may reject the unknown `stream_options` field.
+        if (this._isUnsupportedStreamOptions(error)) {
+          delete requestParams.stream_options;
+          stream = await this.openai.chat.completions.create(requestParams, {
+            signal
+          });
+        } else {
+          throw error;
+        }
+      }
 
       // Processar o stream
       await this._processStream(stream, onChunk, signal);
@@ -161,24 +178,10 @@ class AiClient {
             }
           : undefined;
 
-        // Pricing do provider API (OpenRouter devolve pricing em /models, strings por 1M tokens)
-        let pricing;
-        if (model.pricing && (model.pricing.prompt != null || model.pricing.completion != null)) {
-          const toPer1M = (value) => {
-            const parsed = this._parsePricePer1M(value);
-            if (parsed == null) return null;
-            // Convert suspicious token price values to USD per 1M tokens
-            if (parsed > 0 && parsed < 0.01) {
-              return parsed * 1e6;
-            }
-            return parsed;
-          };
-
-          pricing = {
-            prompt: toPer1M(model.pricing.prompt),
-            completion: toPer1M(model.pricing.completion),
-          };
-        }
+        // Pricing do provider API (OpenRouter/Kilo devolvem $/token em strings).
+        // A normalização é feita por `priceCatalog` (mesma regra da referência do Kilo):
+        // conversão incondicional de $/token para $/1M tokens, negativos = preço desconhecido.
+        const pricing = normalizePricingBlock(model.pricing);
 
         return {
           id: model.id,
@@ -189,7 +192,7 @@ class AiClient {
           hasInternalReasoning: Boolean(model.pricing?.internal_reasoning),
           reasoning: reasoningInfo,
           thinkingModes,
-          pricing,
+          pricing: pricing || undefined,
         };
       });
 
@@ -353,6 +356,7 @@ class AiClient {
         toolCalls: null,
         finishReason: null,
         usage: null,
+        responseModel: null,
         rawResponse: response,
         error: response.error,
       };
@@ -369,12 +373,75 @@ class AiClient {
       content: message.content || null,
       toolCalls: message.tool_calls || null,
       finishReason: choice.finish_reason || null,
-      usage: response.usage ? {
-        promptTokens: response.usage.prompt_tokens,
-        completionTokens: response.usage.completion_tokens,
-      } : null,
+      usage: this._normalizeUsage(response.usage),
+      responseModel: response.model || null,
       rawResponse: response,
     };
+  }
+
+  /**
+   * Normalises a provider usage block into the shape used across the app.
+   *
+   * Handles both the OpenAI-compatible layout (`prompt_tokens`,
+   * `prompt_tokens_details.cached_tokens`) and the Anthropic-style layout
+   * (`input_tokens`, `cache_read_input_tokens`), where the cache counters are
+   * NOT included in the prompt total.
+   *
+   * @param {object|null} usage
+   * @returns {{promptTokens: number|null, completionTokens: number|null, cacheReadTokens: number, cacheWriteTokens: number, cacheIncludedInPrompt: boolean, totalTokens: number|null}|null}
+   * @private
+   */
+  _normalizeUsage(usage) {
+    if (!usage || typeof usage !== 'object') return null;
+
+    const promptTokens = usage.prompt_tokens != null
+      ? Number(usage.prompt_tokens)
+      : (usage.input_tokens != null ? Number(usage.input_tokens) : null);
+    const completionTokens = usage.completion_tokens != null
+      ? Number(usage.completion_tokens)
+      : (usage.output_tokens != null ? Number(usage.output_tokens) : null);
+
+    const detailsCached = usage.prompt_tokens_details?.cached_tokens != null
+      ? usage.prompt_tokens_details.cached_tokens
+      : usage.input_tokens_details?.cached_tokens;
+
+    let cacheReadTokens = 0;
+    // OpenAI-compatible APIs report cached tokens *inside* prompt_tokens;
+    // Anthropic-style APIs report them separately (already excluded from the total).
+    let cacheIncludedInPrompt = true;
+
+    if (detailsCached != null) {
+      cacheReadTokens = Number(detailsCached) || 0;
+      cacheIncludedInPrompt = true;
+    } else if (usage.cache_read_input_tokens != null) {
+      cacheReadTokens = Number(usage.cache_read_input_tokens) || 0;
+      cacheIncludedInPrompt = false;
+    }
+
+    const cacheWriteTokens = usage.cache_creation_input_tokens != null
+      ? Number(usage.cache_creation_input_tokens)
+      : (usage.cache_write_tokens != null ? Number(usage.cache_write_tokens) : 0);
+
+    return {
+      promptTokens: Number.isFinite(promptTokens) ? promptTokens : null,
+      completionTokens: Number.isFinite(completionTokens) ? completionTokens : null,
+      cacheReadTokens: Number.isFinite(cacheReadTokens) ? cacheReadTokens : 0,
+      cacheWriteTokens: Number.isFinite(cacheWriteTokens) ? cacheWriteTokens : 0,
+      cacheIncludedInPrompt,
+      totalTokens: usage.total_tokens != null ? Number(usage.total_tokens) : null,
+    };
+  }
+
+  /**
+   * Detects a provider rejecting the `stream_options` request field.
+   * @private
+   */
+  _isUnsupportedStreamOptions(error) {
+    if (!error) return false;
+    const status = error?.status ?? error?.response?.status;
+    if (status !== 400 && status !== 422) return false;
+    const message = String(error?.error?.message || error?.message || '');
+    return /stream_options/i.test(message);
   }
 
   /**
@@ -391,21 +458,6 @@ class AiClient {
     if (model.includes('gpt-3.5-turbo')) return 4096;
 
     return 32768; // Sensible modern default when provider doesn't specify
-  }
-
-  /**
-   * Converts a pricing value (string or number) to USD per 1M tokens.
-   * OpenRouter returns strings like "$0.15"; some providers return numbers.
-   * @private
-   * @returns {number|null}
-   */
-  _parsePricePer1M(value) {
-    if (value == null) return null;
-    if (typeof value === 'number') return value;
-    const str = String(value).trim().replace(/[$,\s]/g, '');
-    if (!str) return null;
-    const num = Number(str);
-    return Number.isFinite(num) ? num : null;
   }
 
   /**
@@ -462,10 +514,20 @@ class AiClient {
 
   /**
    * Processa o stream do OpenAI e chama callback com chunks normalizados.
+   *
+   * The `finish` event is emitted **once**, after the stream ends, so a usage block
+   * arriving in a trailing chunk (OpenAI's `stream_options.include_usage` behaviour)
+   * is still attached to it. Providers that put `usage` in the `finish_reason` chunk
+   * (Kilo does) keep working unchanged.
+   *
    * @private
    */
   async _processStream(stream, onChunk, abortSignal) {
     const toolCallsBuffer = new Map(); // To accumulate tool calls coming in multiple chunks
+
+    let finishReason = null;
+    let usage = null;
+    let responseModel = null;
 
     try {
       for await (const chunk of stream) {
@@ -474,7 +536,18 @@ class AiClient {
           throw new DOMException('The operation was aborted.', 'AbortError');
         }
 
-        const delta = chunk.choices?.[0]?.delta;
+        // Usage can arrive in ANY chunk: the finish_reason chunk (Kilo) or a
+        // trailing chunk after it (OpenAI-compatible providers).
+        if (chunk?.usage) {
+          const normalized = this._normalizeUsage(chunk.usage);
+          if (normalized) usage = normalized;
+        }
+        if (chunk?.model && !responseModel) {
+          responseModel = chunk.model;
+        }
+
+        const choice = chunk.choices?.[0];
+        const delta = choice?.delta;
         if (!delta) continue;
 
         // Process content delta
@@ -544,9 +617,11 @@ class AiClient {
           }
         }
 
-        // Verificar finish reason
-        const finishReason = chunk.choices?.[0]?.finish_reason;
-        if (finishReason) {
+        // Verificar finish reason (NÃO interrompe o stream: o usage pode vir depois)
+        const reason = choice?.finish_reason;
+        if (reason && !finishReason) {
+          finishReason = reason;
+
           // Finalizar tool calls pendentes
           for (const [index, toolCall] of toolCallsBuffer) {
             onChunk({
@@ -554,23 +629,6 @@ class AiClient {
               toolCallId: toolCall.id || `call_${index}`,
             });
           }
-
-          // Enviar evento de finish
-          const finalToolCalls = Array.from(toolCallsBuffer.values()).map(tc => ({
-            id: tc.id,
-            type: 'function',
-            function: { ...tc.function },
-          }));
-          onChunk({
-            type: 'finish',
-            finishReason,
-            usage: chunk.usage ? {
-              promptTokens: chunk.usage.prompt_tokens,
-              completionTokens: chunk.usage.completion_tokens,
-            } : null,
-            toolCalls: finalToolCalls,
-          });
-          break; // Terminar processamento do stream
         }
       }
     } catch (error) {
@@ -584,6 +642,23 @@ class AiClient {
         error: structuredError,
       });
       throw error;
+    }
+
+    // Evento de finish emitido uma única vez, já com o usage (seja o do chunk de
+    // finish_reason, seja o de um chunk final posterior).
+    if (finishReason || usage) {
+      const finalToolCalls = Array.from(toolCallsBuffer.values()).map(tc => ({
+        id: tc.id,
+        type: 'function',
+        function: { ...tc.function },
+      }));
+      onChunk({
+        type: 'finish',
+        finishReason: finishReason || null,
+        usage,
+        responseModel,
+        toolCalls: finalToolCalls,
+      });
     }
   }
 }

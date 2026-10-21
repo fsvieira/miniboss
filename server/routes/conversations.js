@@ -56,6 +56,18 @@ router.put('/:id/model', (req, res) => {
     provider_id = Number(providerId);
   }
 
+  // Paid-model gate (A12): a model with a known positive price is rejected while
+  // the gate is closed, so the conversation never reaches a paid provider call.
+  try {
+    const { checkPaidModelGate } = require('../services/ai/pricing');
+    const gate = checkPaidModelGate(String(model).trim());
+    if (!gate.allowed) {
+      return res.status(403).json({ error: gate.reason, paid_model_blocked: true });
+    }
+  } catch (gateErr) {
+    console.error('[conversations] Paid-model gate check failed:', gateErr);
+  }
+
   const data = { model: String(model).trim() };
   if (provider_id !== null) data.provider_id = provider_id;
   if (thinkingMode !== undefined) data.thinking_mode = thinkingMode ? serializeThinkingMode(thinkingMode) : null;
@@ -154,6 +166,7 @@ router.get('/:id/context', (req, res) => {
 
       // Metrics (Phase D): total token usage of conversation + descendants
       const usage = db.getConversationTokenUsage(req.params.id);
+      const modelsBreakdown = db.getConversationTokenUsageByModel(req.params.id);
       const subtreeIds = db.getConversationSubtreeIds(req.params.id);
       let question_count = 0;
       try {
@@ -183,6 +196,11 @@ router.get('/:id/context', (req, res) => {
         total_tokens: usage.total_tokens,
         total_cost: usage.total_cost_usd,
         models: usage.models,
+        models_breakdown: modelsBreakdown,
+        cost_coverage: usage.coverage,
+        priced_calls: usage.priced_calls,
+        unpriced_calls: usage.unpriced_calls,
+        cost_partial: usage.partial,
         question_count,
         subbot_count: Math.max(0, subtreeIds.length - 1),
         focus_level,
@@ -393,6 +411,15 @@ router.delete('/:id', (req, res) => {
       if (!conversation.parent_id) {
         await gitService.deleteConversationWorktree(req.params.id);
       }
+
+      // The sandbox container belongs to the conversation: remove it with it.
+      try {
+        const { removeContainerForConversation } = require('../services/sandbox/podmanExecutor');
+        removeContainerForConversation(req.params.id);
+      } catch (containerError) {
+        console.warn('[delete] Failed to remove the sandbox container:', containerError?.message || containerError);
+      }
+
       db.deleteConversation(req.params.id);
 
       // Notify the Project Memory conversation of the deletion: inject a user

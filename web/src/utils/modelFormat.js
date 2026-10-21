@@ -20,6 +20,21 @@ export function formatPricePer1M(value) {
   return '$' + num.toFixed(4);
 }
 
+/**
+ * A model is "paid" when its catalog price is known and greater than zero.
+ * A model with an unknown price is NOT considered paid — we cannot prove it costs money.
+ *
+ * @param {object|null} model - ModelInfo with a `pricing` block (USD per 1M tokens).
+ * @returns {boolean}
+ */
+export function isPaidModel(model) {
+  const pricing = model?.pricing;
+  if (!pricing) return false;
+  const prompt = Number(pricing.prompt);
+  const completion = Number(pricing.completion);
+  return (Number.isFinite(prompt) && prompt > 0) || (Number.isFinite(completion) && completion > 0);
+}
+
 const EFFORT_LABELS = {
   none: 'None',
   off: 'None',

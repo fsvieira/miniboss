@@ -423,15 +423,41 @@ if (!messagesColumns2.includes('status')) {
          id INTEGER PRIMARY KEY AUTOINCREMENT,
          conversation_id INTEGER NOT NULL,
          model TEXT,
+         requested_model TEXT,
+         response_model TEXT,
          prompt_tokens INTEGER NOT NULL DEFAULT 0,
          completion_tokens INTEGER NOT NULL DEFAULT 0,
+         cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+         cache_write_tokens INTEGER NOT NULL DEFAULT 0,
          cost_usd REAL,
+         pricing_source TEXT,
+         provider_id INTEGER,
          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
          FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
        );
        CREATE INDEX IF NOT EXISTS idx_token_usage_conversation ON conversation_token_usage(conversation_id, created_at);
      `);
      console.log('[DB] Migration: conversation_token_usage table created');
+   }
+
+   // Migration: conversation_token_usage — audit columns (additive, idempotent).
+   // Keeps enough information to reconcile the stored cost with the provider's billing:
+   // which model was requested, which model answered, the cache counters and the
+   // origin of the price used ('provider' | 'computed' | 'requested' | 'unknown' | 'stale').
+   const tokenUsageColumns = db.prepare("PRAGMA table_info(conversation_token_usage)").all().map(col => col.name);
+   const tokenUsageColumnDefs = [
+    ['requested_model', 'TEXT'],
+    ['response_model', 'TEXT'],
+    ['cache_read_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+    ['cache_write_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+    ['pricing_source', 'TEXT'],
+    ['provider_id', 'INTEGER'],
+   ];
+   for (const [column, definition] of tokenUsageColumnDefs) {
+     if (!tokenUsageColumns.includes(column)) {
+       db.prepare(`ALTER TABLE conversation_token_usage ADD COLUMN ${column} ${definition}`).run();
+       console.log(`[DB] Migration: added ${column} column to conversation_token_usage`);
+     }
    }
 
    // =====================================================================

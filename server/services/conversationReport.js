@@ -264,6 +264,25 @@ async function generateConversationReport({ targetConversationId, projectConvers
     };
   }
 
+  // The report is a real provider call: its usage must be recorded, otherwise this
+  // spend is invisible (A7).
+  try {
+    const usage = result && result.usage;
+    if (usage && (usage.promptTokens != null || usage.completionTokens != null)) {
+      const { recordUsage } = require('./ai/usageRecorder');
+      recordUsage({
+        db: database,
+        conversationId: target.id,
+        requestedModel: model,
+        responseModel: result.responseModel || null,
+        usage,
+        providerId: provider.id || null,
+      });
+    }
+  } catch (usageErr) {
+    console.error('[conversationReport] Failed to record token usage:', usageErr);
+  }
+
   const content = result && result.content ? String(result.content) : null;
   if (!content) {
     const reason = (result && result.error && (result.error.message || result.error.error_message)) || 'empty response from provider';

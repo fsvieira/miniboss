@@ -4,7 +4,7 @@ import { getProviders, getActiveProvider } from '../api/providers';
 import { fetchModels } from '../api/ai';
 import { getSetting } from '../api/settings';
 import ModelDetailsPanel from './ModelDetailsPanel';
-import { findMatchingThinkingValue } from '../utils/modelFormat';
+import { findMatchingThinkingValue, isPaidModel } from '../utils/modelFormat';
 
 export default function ConversationModelModal({ open, onClose, conversation, onSave }) {
   const [providers, setProviders] = useState([]);
@@ -17,6 +17,8 @@ export default function ConversationModelModal({ open, onClose, conversation, on
   const [noProviderMessage, setNoProviderMessage] = useState('');
   // Raw thinking candidate: conversation value, otherwise global default
   const [thinkingCandidate, setThinkingCandidate] = useState('');
+  // Paid-model gate (server setting `allow_paid_models`)
+  const [allowPaidModels, setAllowPaidModels] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -34,13 +36,15 @@ export default function ConversationModelModal({ open, onClose, conversation, on
   const loadProviders = async () => {
     setNoProviderMessage('');
     try {
-      const [providersData, activeProvider, defaultModelValue, defaultThinkingValue] = await Promise.all([
+      const [providersData, activeProvider, defaultModelValue, defaultThinkingValue, allowPaidValue] = await Promise.all([
         getProviders(),
         getActiveProvider().catch(() => null),
         getSetting('default_model').catch(() => null),
         getSetting('default_thinking_mode').catch(() => null),
+        getSetting('allow_paid_models').catch(() => null),
       ]);
       setProviders(providersData);
+      setAllowPaidModels(String(allowPaidValue) === 'true' || allowPaidValue === '1');
 
       let providerId = conversation?.provider_id;
       if (providerId && !providersData.some((p) => String(p.id) === String(providerId))) {
@@ -123,6 +127,17 @@ export default function ConversationModelModal({ open, onClose, conversation, on
     m.id.toLowerCase().includes(modelSearch.toLowerCase())
   );
 
+  // Paid models are hidden while the gate is closed (A12).
+  const selectableModels = allowPaidModels
+    ? filteredModels
+    : filteredModels.filter((m) => !isPaidModel(m));
+
+  const blockedPaidModels = allowPaidModels
+    ? []
+    : filteredModels.filter((m) => isPaidModel(m));
+
+  const selectedModelIsPaid = !allowPaidModels && isPaidModel(selectedModelObject);
+
   const handleSave = async () => {
     try {
       const payload = {
@@ -182,13 +197,26 @@ export default function ConversationModelModal({ open, onClose, conversation, on
                 onChange={handleModelChange}
                 label="Modelo"
               >
-                {filteredModels.map((model) => (
+                {selectableModels.map((model) => (
                   <MenuItem key={model.id} value={model.id}>
                     {model.id}
                   </MenuItem>
                 ))}
               </Select>
             </FormControl>
+
+            {!allowPaidModels && blockedPaidModels.length > 0 && (
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                {blockedPaidModels.length} modelo(s) pago(s) ocultos — ative &quot;Allow paid models&quot; em Settings
+                depois de o audit de custos passar.
+              </Typography>
+            )}
+
+            {selectedModelIsPaid && (
+              <Typography variant="caption" color="warning.main" sx={{ display: 'block' }}>
+                O modelo seleccionado é pago e está bloqueado — o servidor vai rejeitar a chamada.
+              </Typography>
+            )}
 
             {supportsReasoning && thinkingModes.length > 0 && (
               <FormControl fullWidth margin="normal">

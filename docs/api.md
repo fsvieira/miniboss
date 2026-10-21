@@ -100,6 +100,7 @@ Base path: `/api/providers`
 | PUT | `/:id` | Update a provider |
 | DELETE | `/:id` | Delete a provider |
 | POST | `/:id/activate` | Set active provider |
+| POST | `/:id/refresh-pricing` | Refresh the pricing catalog of a provider (200 on success, 502 on provider error) |
 
 ### AI API
 
@@ -143,4 +144,57 @@ Base path: `/api/sandbox`
 | POST | `/paths` | Add sandbox path |
 | PUT | `/paths/:id` | Update sandbox path |
 | DELETE | `/paths/:id` | Remove sandbox path |
+
+---
+
+## Cost accounting
+
+### Settings
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `allow_paid_models` | `false` | While `false`, models with a known positive price are hidden in the model picker and rejected by the server (`403` on `PUT /api/conversations/:id/model`, and the AI call is refused with a clear message). |
+| `sandbox_image` | `docker.io/library/node:22-bookworm` | Image used by the Podman sandbox. |
+
+### Aggregated usage
+
+`GET /api/conversations/:id/context` (and the `context_info` socket event) expose:
+
+| Field | Description |
+|-------|-------------|
+| `total_cost` | Sum of the priced calls. `null` when the total is unknown. |
+| `cost_coverage` | `priced_calls / (priced_calls + unpriced_calls)` — `1` when every call is priced. |
+| `cost_partial` | `true` when at least one call has no known price. |
+| `priced_calls` / `unpriced_calls` | Number of priced and unpriced AI calls. |
+| `models_breakdown` | Per-model cost, call count and unpriced call count. |
+
+The UI shows `≈ $X` when the total is partial and `—` when it is unknown. An unknown
+price is never rendered as `$0.00`.
+
+### Audit scripts
+
+```sh
+# Recompute every recorded cost with the current algorithm and compare it with
+# the stored value. Exits non-zero when the delta is above the tolerance (1%),
+# when a call is unpriced, or when a usage block has no matching row.
+node server/scripts/costAudit.js [--conversation <id>] [--since YYYY-MM-DD] [--tolerance 1] [--no-network]
+
+# Ground-truth probe: sends one fixed small request and prints the computed cost.
+node server/scripts/costProbe.js --model <model-id> [--provider <id>] [--json]
+```
+
+**Ground-truth procedure** (the check that the cost MiniBoss reports matches the
+provider's billing):
+
+1. Run `node server/scripts/costProbe.js --model anthropic/claude-sonnet-5`.
+   The script refreshes the catalog, sends the request and prints the usage, the
+   price it used and the computed cost.
+2. Open the provider dashboard (Kilo → Usage) and find the same request — it is
+   the one with the probe's prompt and the printed token counts.
+3. Compare the two amounts. They must agree, with **one documented exception**:
+   the OpenAI-compatible response does not expose the cache counters, so a cached
+   prompt is billed *cheaper* by the provider than the estimate printed by the
+   probe. The cache prices are stored in the catalog, so the estimate can be
+   corrected as soon as the provider exposes the counters.
+4. Only after the numbers agree, flip `allow_paid_models` to `true`.
 | GET | `/browse` | Browse directory entries |

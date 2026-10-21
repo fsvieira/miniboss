@@ -6,6 +6,20 @@ const { DatabaseAPI, DatabaseConnection } = require('../services/db');
 const connection = new DatabaseConnection();
 const db = new DatabaseAPI(connection);
 
+/**
+ * Refreshes the pricing catalog of a provider (never throws).
+ * @param {Object} provider
+ * @param {{force?: boolean}} [options]
+ */
+async function refreshPricingCatalog(provider, options = {}) {
+  const { refreshModelPricing } = require('../services/ai/pricing');
+  return refreshModelPricing({
+    provider,
+    providerId: provider.id,
+    force: options.force === true,
+  });
+}
+
 // GET all providers
 router.get('/', (req, res) => {
   const providers = db.getAllProviders().map(p => ({
@@ -87,6 +101,12 @@ router.put('/:id', (req, res) => {
   const updated = db.updateProvider(req.params.id, data);
   if (!updated) return res.status(404).json({ error: 'Provider not found' });
 
+  // The provider changed (credentials or endpoint): its pricing catalog is
+  // probably stale — refresh it in the background.
+  if (data.api_key !== undefined || data.base_url !== undefined) {
+    refreshPricingCatalog(updated).catch(() => {});
+  }
+
   res.json({
     id: updated.id,
     name: updated.name,
@@ -107,6 +127,11 @@ router.delete('/:id', (req, res) => {
 router.post('/:id/activate', (req, res) => {
   const provider = db.setActiveProvider(req.params.id);
   if (!provider) return res.status(404).json({ error: 'Provider not found' });
+
+  // Refresh the pricing catalog in the background: a provider outage must never
+  // block the activation.
+  refreshPricingCatalog(provider).catch(() => {});
+
   res.json({
     id: provider.id,
     name: provider.name,
@@ -114,6 +139,25 @@ router.post('/:id/activate', (req, res) => {
     is_active: provider.is_active,
     created_at: provider.created_at,
     updated_at: provider.updated_at
+  });
+});
+
+// POST refresh the pricing catalog of a provider
+router.post('/:id/refresh-pricing', async (req, res) => {
+  const provider = db.getProvider(req.params.id);
+  if (!provider) return res.status(404).json({ error: 'Provider not found' });
+
+  const result = await refreshPricingCatalog(provider, { force: true });
+  if (!result.ok) {
+    return res.status(502).json({
+      error: result.error || 'Failed to refresh pricing catalog',
+      stale: true,
+    });
+  }
+
+  res.json({
+    success: true,
+    models: Array.isArray(result.models) ? result.models.length : 0,
   });
 });
 

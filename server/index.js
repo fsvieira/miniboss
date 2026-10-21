@@ -1,21 +1,20 @@
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
-const { execSync } = require('child_process');
+const { checkSandboxRuntime, startSandboxSweeper } = require('./services/sandbox');
 
-// Verify bubblewrap is available (mandatory for sandbox)
-function checkBwrapAvailable() {
+/**
+ * The sandbox is mandatory. The runtime is podman by default and bwrap as the
+ * fallback (`SANDBOX_RUNTIME=bwrap`).
+ */
+async function verifySandbox() {
   try {
-    execSync('which bwrap', { stdio: 'ignore' });
-    console.log('[Startup] bubblewrap (bwrap) found - sandbox enabled');
-  } catch {
-    console.error('[Startup] FATAL: bubblewrap (bwrap) not found. Sandbox is mandatory.');
-    console.error('[Startup] Install bubblewrap: apt-get install bubblewrap (Debian/Ubuntu) or equivalent');
+    await checkSandboxRuntime();
+  } catch (err) {
+    console.error(`[Startup] FATAL: ${err.message}`);
     process.exit(1);
   }
 }
-
-checkBwrapAvailable();
 
 const express = require('express');
 const cors = require('cors');
@@ -94,12 +93,45 @@ try {
 }
 
 // Start server
-const httpServer = server.listen(PORT, HOST, () => {
-  console.log(`Server running on http://${HOST}:${PORT}`);
-  console.log(`Data folder: ${getDataFolder()}`);
-  console.log(`Database: ${getDatabasePath()}`);
-  console.log(`Worktrees: ${getWorktreesRoot()}`);
-});
+let httpServer = null;
+
+/**
+ * Applies the sandbox settings stored in the settings table
+ * (`sandbox_image` overrides the default image).
+ */
+function applySandboxSettings() {
+  try {
+    const { setSandboxImage } = require('./services/sandbox/runtime');
+    const { DatabaseAPI, DatabaseConnection } = require('./services/db');
+    const connection = new DatabaseConnection();
+    try {
+      const db = new DatabaseAPI(connection);
+      setSandboxImage(db.getSetting('sandbox_image'));
+    } finally {
+      connection.close();
+    }
+  } catch (err) {
+    console.warn('[Startup] Could not read the sandbox settings:', err?.message || err);
+  }
+}
+
+async function start() {
+  // The sandbox is mandatory: do not accept traffic before it is verified.
+  applySandboxSettings();
+  await verifySandbox();
+
+  httpServer = server.listen(PORT, HOST, () => {
+    console.log(`Server running on http://${HOST}:${PORT}`);
+    console.log(`Data folder: ${getDataFolder()}`);
+    console.log(`Database: ${getDatabasePath()}`);
+    console.log(`Worktrees: ${getWorktreesRoot()}`);
+  });
+
+  // Sandbox lifecycle: idle stop + orphan cleanup.
+  startSandboxSweeper();
+}
+
+start();
 
 async function shutdown(signal) {
   console.log(`[Shutdown] Received ${signal}, shutting down...`);
@@ -107,6 +139,7 @@ async function shutdown(signal) {
     const cm = serviceFactory.getConversationManager();
     if (cm?.recoverStuckStates) cm.recoverStuckStates();
   } catch (err) { console.error('[Shutdown] Error:', err); }
+  if (!httpServer) { process.exit(0); return; }
   httpServer.close(() => { console.log('[Shutdown] HTTP closed'); process.exit(0); });
   setTimeout(() => { console.error('[Shutdown] Force exit'); process.exit(1); }, 10000);
 }

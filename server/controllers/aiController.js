@@ -250,10 +250,11 @@ class AIController {
       const models = await aiClient.listModels();
       aiClient.close();
 
-      // Pricing cache (Phase D) for cost calculation
+      // Pricing catalog refresh (A3/A4) — scoped to this provider so a fetch
+      // replaces exactly its own entries and never resurrects stale ones.
       try {
         const { cacheModelPricing } = require('../services/ai/pricing');
-        cacheModelPricing(models);
+        cacheModelPricing(models, { providerId: provider.id, source: 'provider' });
       } catch (_) {}
 
       res.json(models);

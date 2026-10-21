@@ -574,6 +574,13 @@ async function sendToAI({
         contextInfoPayload.total_tokens = usage.total_tokens;
         contextInfoPayload.total_cost = usage.total_cost_usd;
         contextInfoPayload.models = usage.models;
+        contextInfoPayload.cost_coverage = usage.coverage;
+        contextInfoPayload.priced_calls = usage.priced_calls;
+        contextInfoPayload.unpriced_calls = usage.unpriced_calls;
+        contextInfoPayload.cost_partial = usage.partial;
+        try {
+          contextInfoPayload.models_breakdown = db.getConversationTokenUsageByModel(conversationId);
+        } catch (_) {}
         contextInfoPayload.subbot_count = Math.max(0, subtreeIds.length - 1);
         contextInfoPayload.focus_level = conversation && conversation.parent_id ? (() => {
           let level = 0;
@@ -634,6 +641,7 @@ async function sendToAI({
   let accumulatedContent = '';
   let finishReason = null;
   let usage = null;
+  let responseModel = null;
 
   try {
     await aiClient.chatCompletionStream(
@@ -654,6 +662,7 @@ async function sendToAI({
         } else if (chunk.type === 'finish') {
           finishReason = chunk.finishReason;
           usage = chunk.usage;
+          responseModel = chunk.responseModel || null;
           if (chunk.toolCalls && chunk.toolCalls.length > 0) {
             toolCallsList.push(...chunk.toolCalls);
           }
@@ -671,9 +680,14 @@ async function sendToAI({
     content,
     toolCalls,
     finishReason: finishReason || null,
+    responseModel: responseModel || null,
     usage: usage ? {
       promptTokens: usage.promptTokens,
       completionTokens: usage.completionTokens,
+      cacheReadTokens: usage.cacheReadTokens || 0,
+      cacheWriteTokens: usage.cacheWriteTokens || 0,
+      cacheIncludedInPrompt: usage.cacheIncludedInPrompt !== false,
+      totalTokens: usage.totalTokens != null ? usage.totalTokens : null,
     } : null,
     rawResponse: {
       choices: [{
@@ -683,6 +697,7 @@ async function sendToAI({
         },
         finish_reason: finishReason || 'stop',
       }],
+      model: responseModel || targetModel,
       usage: usage ? {
         prompt_tokens: usage.promptTokens,
         completion_tokens: usage.completionTokens,

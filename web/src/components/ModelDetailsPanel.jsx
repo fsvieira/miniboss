@@ -33,6 +33,12 @@ export default function ModelDetailsPanel({ model }) {
       <DetailRow label="Janela de contexto" value={formatTokens(model.contextWindow)} />
       <DetailRow label="Prompt price" value={`${formatPricePer1M(pricing.prompt)} / 1M`} />
       <DetailRow label="Completion price" value={`${formatPricePer1M(pricing.completion)} / 1M`} />
+      {pricing.cacheRead != null && (
+        <DetailRow label="Cache read price" value={`${formatPricePer1M(pricing.cacheRead)} / 1M`} />
+      )}
+      {pricing.cacheWrite != null && (
+        <DetailRow label="Cache write price" value={`${formatPricePer1M(pricing.cacheWrite)} / 1M`} />
+      )}
 
       {efforts.length > 0 && (
         <DetailRow

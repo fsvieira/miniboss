@@ -413,7 +413,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
       type: "function",
       function: {
         name: "runCommand",
-        description: `Execute a shell command. CWD = "${workingDir}". PREFER ABSOLUTE PATHS to avoid ambiguity — use the CWD above as your base. Relative paths work (resolved from CWD) but avoid relative path traversal (e.g. '../data/chat.db' might leave the worktree). Runs inside a bubblewrap (bwrap) sandbox when available. Supports optional timeout (ms). Use this for running tests, builds, lints, or other development tasks. The command output will be returned as the result.`,
+        description: `Execute a shell command. CWD = "${workingDir}". PREFER ABSOLUTE PATHS to avoid ambiguity — use the CWD above as your base. Relative paths work (resolved from CWD) but avoid relative path traversal (e.g. '../data/chat.db' might leave the worktree). Runs inside an isolated sandbox container. Supports optional timeout (ms). Use this for running tests, builds, lints, or other development tasks. The command output will be returned as the result.`,
         parameters: {
           type: "object",
           properties: {
@@ -461,7 +461,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
     // Enforce plan mode read-only filtering for ALL conversation types that support mode switching.
     // This removes write tools from the exposed tool list when conversationMode === 'plan'.
     // runCommand IS allowed in plan mode: it always executes in the read-only sandbox
-    // (worktree mounted read-only), so writes are blocked by bwrap.
+    // (worktree mounted read-only), so writes are blocked by the sandbox.
     const isPlanMode = conversationMode === 'plan';
     if (isPlanMode) {
       const writeTools = [
