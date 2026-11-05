@@ -174,7 +174,7 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
 
   const handleSetupProject = () => {
     handleSendMessage(
-      'Analyze the project associated with this conversation and produce a plan (via updatePlan) to create or update the .miniboss/setup.sh file in the project worktree. The script must install, as root, once inside the Podman container, everything needed to develop, test and run this project. Detect the project stack (package.json, Makefile, Dockerfile, etc.), identify the required dependencies and tools, generate an idempotent script (use command -v, set -e). Use runCommand only for inspection. Do NOT try to write files directly — Project Memory is read-only; the plan will be executed in a separate implementation conversation. Do not touch the repo-root.'
+      'Act as project manager for the project associated with this conversation: analyze the project and produce a plan (via updatePlan) to create or update the .miniboss/setup.sh file in the project worktree. The script must install, as root, once inside the Podman container, everything needed to develop, test and run this project. Detect the project stack (package.json, Makefile, Dockerfile, etc.), identify required dependencies and tools, and generate an idempotent script (use command -v, set -e). Use runCommand only for inspection. Raise any requirements, potential problems, or open questions you foresee, and discuss viability with the user before finalizing. The plan should convey intentions, concepts and tips — not overly prescriptive steps; execution happens in a separate implementation conversation. Do not write files directly (Project Memory is read-only). Do not touch the repo-root.'
     );
   };
 
