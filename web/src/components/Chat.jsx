@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { observer } from 'mobx-react-lite';
 import { Box, IconButton, useTheme, useMediaQuery, Typography, Chip, Breadcrumbs, Link } from '@mui/material';
-import { Menu, MoreVert, ListAlt, ArrowBack, Lock, Checklist, Restore } from '@mui/icons-material';
+import { Menu, MoreVert, ListAlt, ArrowBack, Lock, Checklist, Restore, Settings } from '@mui/icons-material';
 
 import { clearConversationMessages, cancelConversationAI } from '../api/settings';
 import chatStore from '../stores/chatStore';
@@ -169,6 +169,12 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
   const handleWhereWasI = () => {
     handleSendMessage(
       'Do a recap of the project state: current focus, what was being done, recent decisions, discoveries, related ideas, ongoing executions and next steps.'
+    );
+  };
+
+  const handleSetupProject = () => {
+    handleSendMessage(
+      'Analyze the project associated with this conversation and create or update the .miniboss/setup.sh file in the project worktree. The script must install, as root, once inside the Podman container, everything needed to develop, test and run this project. Detect the project stack (package.json, Makefile, Dockerfile, etc.), identify the required dependencies and tools, generate an idempotent script (use command -v, set -e). Use runCommand only for inspection; write with writeFile. Do not touch the repo-root.'
     );
   };
 
@@ -395,6 +401,18 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
               color="info"
               variant="outlined"
               onClick={handleWhereWasI}
+              clickable
+              sx={{ fontSize: '0.7rem', height: 24, cursor: 'pointer' }}
+            />
+          )}
+          {isProjectMemory && (
+            <Chip
+              icon={<Settings fontSize="small" />}
+              label="Setup Project"
+              size="small"
+              color="primary"
+              variant="outlined"
+              onClick={handleSetupProject}
               clickable
               sx={{ fontSize: '0.7rem', height: 24, cursor: 'pointer' }}
             />
