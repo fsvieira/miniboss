@@ -212,6 +212,7 @@ class ConversationManager {
             hadResult,
             resultLen,
             status,
+            captureSource: result && typeof result === 'object' ? result.captureSource : undefined,
         });
 
         if (!hadResult && !toolError) {
@@ -263,6 +264,7 @@ class ConversationManager {
             hadResult,
             resultLen,
             dbError,
+            captureSource: result && typeof result === 'object' ? result.captureSource : undefined,
         });
 
         if (!updateOk) {

@@ -314,6 +314,10 @@ class ToolProcessor {
         )
       ]);
       result.sandboxed = true;
+      // Diagnostic of the sandbox output transport (file/fallback/stream) —
+      // optional: it is absent when the bwrap runtime is used or on non-podman
+      // paths, and that is fine (the audit tolerates its absence).
+      if (result.captureSource == null) result.captureSource = 'unknown';
     } catch (err) {
       result = {
         stdout: '',

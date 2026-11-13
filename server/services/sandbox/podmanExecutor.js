@@ -443,8 +443,19 @@ const CAPTURE_ERR_SUFFIX = '.err';
 /** Suffix of the sentinel file that proves the exchange directory is mounted. */
 const CAPTURE_PROBE_SUFFIX = '.probe';
 
-/** Diagnostics of the output transport (file / fallback / divergence). */
-const captureStats = { file: 0, fallback: 0, divergence: 0 };
+/**
+ * How long the host waits (after the `podman exec` stream closed early) for
+ * the inner command to write the capture files, before falling back to the
+ * stream. The race: `podman exec` intermittently closes the connection before
+ * the command finishes, so `id.rc` does not exist yet — waiting a bounded
+ * amount of time lets the still-running command write the files moments later.
+ */
+const CAPTURE_WAIT_MS = 4000;
+/** Polling interval of `waitForCapture`. */
+const CAPTURE_POLL_MS = 75;
+
+/** Diagnostics of the output transport (file / fallback / divergence / waitMiss). */
+const captureStats = { file: 0, fallback: 0, divergence: 0, waitMiss: 0 };
 
 /** @type {number} Counter of the executions, so the capture ids never collide. */
 let captureCounter = 0;
@@ -485,6 +496,42 @@ function readCaptureFiles(ioDir, id) {
     stderr: readTextFile(path.join(ioDir, `${id}${CAPTURE_ERR_SUFFIX}`)),
     rc: readTextFile(path.join(ioDir, `${id}${CAPTURE_RC_SUFFIX}`)),
   };
+}
+
+/**
+ * Pauses the current async flow.
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Waits (with a bound) for the capture files of an execution to be written by
+ * the inner command. `podman exec` intermittently closes its stream before the
+ * command finishes; when that happens the exit-code file does not exist yet and
+ * a single-shot read would wrongly fall back to the (empty) stream — and the
+ * cleanup would delete the output the command is about to write.
+ *
+ * Polls `readCaptureFiles` until `id.rc` exists or the deadline passes.
+ *
+ * @param {string} ioDir
+ * @param {string} id
+ * @param {number} waitMs - Hard upper bound of the wait (the command timeout is capped here too).
+ * @param {number} [intervalMs]
+ * @returns {Promise<boolean>} True when the exit-code file appeared in time.
+ */
+async function waitForCapture(ioDir, id, waitMs, intervalMs = CAPTURE_POLL_MS) {
+  if (!ioDir || !id) return false;
+  const deadline = Date.now() + Math.max(0, waitMs);
+  while (Date.now() < deadline) {
+    const files = readCaptureFiles(ioDir, id);
+    if (files.rc != null && String(files.rc).trim() !== '') return true;
+    await sleep(intervalMs);
+  }
+  captureStats.waitMiss += 1;
+  return false;
 }
 
 /**
@@ -600,9 +647,25 @@ function resolveCapturedResult(params = {}) {
         captureStats.divergence += 1;
       }
     } else {
-      // No exit code file: the capture did not happen.
+      // No exit code file: the capture did not happen (or the wait timed out).
       captureStats.fallback += 1;
-      stderr = [stderr, '[sandbox] output capture fell back to the exec stream'].filter(Boolean).join('\n');
+      const fallbackNote = '[sandbox] output capture fell back to the exec stream';
+      if (streamStdout.trim() !== '' || streamStderr.trim() !== '') {
+        // Prefer the stream content to an empty result — never leave the
+        // assistant blind when the files never made it in time.
+        if (streamStdout.trim() === '' && streamStderr.trim() !== '') {
+          stdout = streamStderr;
+          stderr = fallbackNote;
+        } else {
+          stderr = [stderr, fallbackNote].filter(Boolean).join('\n');
+        }
+      } else if (!timedOut) {
+        // Exit-0 command that produced neither capture files nor stream content:
+        // surface the loss explicitly instead of returning silent empty.
+        stderr = '[sandbox] capture lost: no output was captured for this command';
+      } else {
+        stderr = [stderr, fallbackNote].filter(Boolean).join('\n');
+      }
     }
   }
 
@@ -1052,7 +1115,7 @@ function buildStackLimitedCommand(command, stackLimit) {
  * @param {string} [options.ioTarget] - Mount point of the exchange inside the container.
  * @param {'file'|'stream'} [options.captureMode] - 'stream' disables the file capture.
  * @param {string} [options.stackLimit] - Soft stack limit (in KB) of the command.
- * @returns {Promise<{stdout: string, stderr: string, exitCode: number, failed: boolean}>}
+ * @returns {Promise<{stdout: string, stderr: string, exitCode: number, failed: boolean, timedOut: boolean, captureSource: string}>}
  */
 async function execInContainer(name, command, cwd, timeoutMs, env, timeoutBinary, options = {}) {
   const {
@@ -1098,6 +1161,22 @@ async function execInContainer(name, command, cwd, timeoutMs, env, timeoutBinary
     throw new Error(`Sandbox container ${name} is missing`);
   }
 
+  // The `podman exec` stream intermittently closes before the inner command
+  // finishes. When the stream is empty and the exit-code file is not written
+  // yet, wait a bounded amount of time for the capture files before deciding
+  // the fallback — otherwise the single-shot read would fall back to the empty
+  // stream and the cleanup below would delete the output being written late.
+  // Never wait when the exec was killed (timedOut): the whole process group
+  // is gone, so the files will not appear and the wait would be pure latency.
+  if (useFileCapture) {
+    const hasStreamContent =
+      String(result.stdout || '').trim() !== '' || String(result.stderr || '').trim() !== '';
+    if (!hasStreamContent && !result.timedOut) {
+      const waitMs = timeoutMs > 0 ? Math.min(timeoutMs, CAPTURE_WAIT_MS) : CAPTURE_WAIT_MS;
+      await waitForCapture(ioDir, id, waitMs);
+    }
+  }
+
   const resolved = resolveCapturedResult({
     mode: useFileCapture ? 'file' : 'stream',
     ioDir,
@@ -1106,6 +1185,8 @@ async function execInContainer(name, command, cwd, timeoutMs, env, timeoutBinary
     timedOut: result.timedOut,
   });
 
+  // The cleanup only happens after the wait and the fallback decision, so the
+  // files are not destroyed while the inner command is still writing them.
   if (useFileCapture) cleanupCaptureFiles(ioDir, id);
 
   const timedOut = resolved.timedOut;
@@ -1117,6 +1198,7 @@ async function execInContainer(name, command, cwd, timeoutMs, env, timeoutBinary
     exitCode: resolved.exitCode,
     failed: resolved.exitCode !== 0,
     timedOut,
+    captureSource: resolved.captureSource,
   };
 }
 
@@ -1368,6 +1450,7 @@ module.exports = {
   buildCaptureId,
   buildStackLimitedCommand,
   resolveCapturedResult,
+  waitForCapture,
   getCaptureStats,
   containerNameFor,
   inspectContainer,

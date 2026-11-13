@@ -14,6 +14,8 @@ const {
   buildCaptureCommand,
   buildStackLimitedCommand,
   resolveCapturedResult,
+  waitForCapture,
+  getCaptureStats,
   containerNameFor,
   isImageMissingError,
   isContainerMissingError,
@@ -33,14 +35,26 @@ function check(label, fn) {
   }
 }
 
+async function checkAsync(label, fn) {
+  try {
+    await fn();
+    passed += 1;
+    console.log(`✅ ${label}`);
+  } catch (err) {
+    console.error(`❌ ${label}`);
+    console.error(err && err.stack ? err.stack : err);
+    process.exitCode = 1;
+    throw err;
+  }
+}
+
 function argValue(args, flag) {
   const index = args.indexOf(flag);
   return index === -1 ? null : args[index + 1];
 }
 
-function runTests() {
+async function runTests() {
   console.log('Running podmanExecutor tests...\n');
-
   const repoRoot = '/test/repo';
   const worktreePath = '/test/worktree';
 
@@ -383,6 +397,85 @@ function runTests() {
     assert.ok(!result.stderr.includes('fell back'), 'the stream mode is not a fallback');
   });
 
+  check('never returns silent empty on exit-0 when the capture files never appear', () => {
+    const ioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-capture-'));
+    try {
+      const result = resolveCapturedResult({
+        mode: 'file',
+        ioDir,
+        id: 'run-empty',
+        stream: { stdout: '', stderr: '', exitCode: 0 },
+      });
+
+      assert.strictEqual(result.captureSource, 'fallback');
+      assert.ok(result.stderr.includes('capture lost'), 'the loss must be surfaced, not silent');
+      assert.strictEqual(result.stdout, '', 'there is genuinely nothing to return');
+    } finally {
+      fs.rmSync(ioDir, { recursive: true, force: true });
+    }
+  });
+
+  check('prefers the stream stderr over an empty stdout on fallback', () => {
+    const ioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-capture-'));
+    try {
+      const result = resolveCapturedResult({
+        mode: 'file',
+        ioDir,
+        id: 'run-stderr',
+        stream: { stdout: '', stderr: 'error from the stream', exitCode: 0 },
+      });
+
+      assert.strictEqual(result.captureSource, 'fallback');
+      assert.strictEqual(result.stdout, 'error from the stream', 'the stream content must not be dropped');
+      assert.ok(result.stderr.includes('fell back'), 'the fallback is still reported');
+    } finally {
+      fs.rmSync(ioDir, { recursive: true, force: true });
+    }
+  });
+
+  check('does not flag a killed command as capture lost', () => {
+    const ioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-capture-'));
+    try {
+      const result = resolveCapturedResult({
+        mode: 'file',
+        ioDir,
+        id: 'run-killed',
+        stream: { stdout: '', stderr: '', exitCode: 124 },
+        timedOut: true,
+      });
+
+      assert.strictEqual(result.captureSource, 'fallback');
+      assert.ok(!result.stderr.includes('capture lost'), 'a killed command has no output to lose');
+      assert.ok(result.stderr.includes('fell back'), 'the timeout fallback is reported');
+    } finally {
+      fs.rmSync(ioDir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('waitForCapture returns true once the exit-code file appears during the wait', async () => {
+    const ioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-wait-'));
+    try {
+      const id = 'run-late';
+      setTimeout(() => fs.writeFileSync(path.join(ioDir, `${id}.rc`), '0\n'), 60);
+      const appeared = await waitForCapture(ioDir, id, 500, 20);
+      assert.strictEqual(appeared, true, 'the late-written exit code must be seen');
+    } finally {
+      fs.rmSync(ioDir, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('waitForCapture returns false when the exit-code file never appears', async () => {
+    const ioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-wait-'));
+    try {
+      const before = getCaptureStats().waitMiss;
+      const appeared = await waitForCapture(ioDir, 'run-never', 120, 20);
+      assert.strictEqual(appeared, false, 'the wait must time out');
+      assert.strictEqual(getCaptureStats().waitMiss, before + 1, 'a timed-out wait is counted');
+    } finally {
+      fs.rmSync(ioDir, { recursive: true, force: true });
+    }
+  });
+
   // ── podman exec ─────────────────────────────────────────────────────────
 
   check('podman exec passes the cwd, the env and the command', () => {
@@ -439,4 +532,8 @@ function runTests() {
   console.log(`\nAll podmanExecutor tests passed (${passed} checks).`);
 }
 
-runTests();
+runTests()
+  .catch((err) => {
+    console.error(err && err.stack ? err.stack : err);
+    process.exitCode = 1;
+  });
