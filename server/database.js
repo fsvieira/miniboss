@@ -13,6 +13,22 @@ if (!fs.existsSync(dbDir)) {
 
 const db = new Database(dbPath);
 
+// Enable WAL + busy_timeout + foreign_keys + synchronous=NORMAL so that the
+// multiple connections to this file (database.js singleton, connection.js, and
+// per-module Database(...) instances) do not intermittently throw SQLITE_BUSY
+// on concurrent writes. WAL is skipped for :memory: databases (tests).
+try {
+  const isMemory = String(dbPath).toLowerCase() === ':memory:';
+  if (!isMemory) {
+    db.pragma('journal_mode = WAL');
+  }
+  db.pragma('busy_timeout = 5000');
+  db.pragma('foreign_keys = ON');
+  db.pragma('synchronous = NORMAL');
+} catch (e) {
+  console.warn('[DB] Failed to apply pragmas:', e.message);
+}
+
 // Create tables
 db.exec(`
    CREATE TABLE IF NOT EXISTS projects (

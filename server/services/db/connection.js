@@ -23,6 +23,21 @@ class DatabaseConnection {
 
     this.db = new Database(dbFilePath);
 
+    // Enable WAL + busy_timeout + foreign_keys + synchronous=NORMAL to avoid
+    // intermittent SQLITE_BUSY with multiple connections writing to the same file.
+    // WAL requires a real file path; skip it for :memory: databases (used in tests).
+    try {
+      const isMemory = String(dbFilePath).toLowerCase() === ':memory:';
+      if (!isMemory) {
+        this.db.pragma('journal_mode = WAL');
+      }
+      this.db.pragma('busy_timeout = 5000');
+      this.db.pragma('foreign_keys = ON');
+      this.db.pragma('synchronous = NORMAL');
+    } catch (e) {
+      console.warn('[DB] Failed to apply pragmas:', e.message);
+    }
+
     // Lightweight migration: add thinking_status column if missing
     try {
       this.db.exec("ALTER TABLE messages ADD COLUMN thinking_status TEXT");

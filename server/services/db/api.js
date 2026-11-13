@@ -934,7 +934,8 @@ class DatabaseAPI {
       return this.getMessage(result.lastInsertRowid);
     }
     catch (e) {
-      console.error("[CREATE MESSAGE DB] Insert or post-insert getMessage failed:", e);
+      console.error("[CREATE MESSAGE DB] Insert or post-insert getMessage failed:", e.stack || e);
+      return undefined;
     }
     
   }

@@ -1,5 +1,8 @@
 const { PROCESSING_STATES, MESSAGE_STATES } = require("../constants/processingStates.js");
 const { computeConversationStatus } = require("./conversationStatus");
+const path = require('path');
+const fs = require('fs');
+const { getDataFolder } = require("../config/paths");
 
 /**
  * Events that stateChange classifies from the message.
@@ -144,6 +147,31 @@ class ConversationManager {
     }
 
     /**
+     * Persistent JSONL audit of tool-result writes. Written to its own file
+     * (data/logs/tool-result-audit.jsonl), NOT the chat.db, so diagnostics do
+     * not add lock contention during the investigation.
+     */
+    _auditToolResult(entry) {
+        try {
+            const dir = path.join(getDataFolder(), 'logs');
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+            }
+            fs.appendFileSync(
+                path.join(dir, 'tool-result-audit.jsonl'),
+                JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n'
+            );
+        } catch (e) {
+            // Audit must never break the tool-result write path.
+            console.error('[ConversationManager] tool-result audit write failed:', e.message);
+        }
+    }
+
+    _sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    /**
      * Receives the result of an executed tool, updates the DB, and broadcasts.
      *
      * 1. Updates the tool message in the DB (status + result)
@@ -151,19 +179,97 @@ class ConversationManager {
      * 3. Checks if there are more pending tools in the conversation
      *    - YES: keeps 'tool_exec' (UI shows "processing tools")
      *    - NO: calls stateChange with TOOLS_COMPLETED to transition
+     *
+     * Async so a transient DB lock (SQLITE_BUSY) can be retried after a short
+     * wait; both callers in toolProcessor.js already `await` it.
      */
-    handleToolResult(conversationId, toolMessageId, result, toolError = null) {
+    async handleToolResult(conversationId, toolMessageId, result, toolError = null) {
         const status = toolError ? 'error' : 'processed';
-        const resultStr = toolError
-            ? JSON.stringify({ error: toolError.message || String(toolError) })
-            : (result ? JSON.stringify(result) : '{}');
+        let resultStr;
+        let hadResult;
+        if (toolError) {
+            resultStr = JSON.stringify({ error: toolError.message || String(toolError) });
+            hadResult = false;
+        } else if (result === null || result === undefined || result === '') {
+            // Distinguish a real empty result from a masked failure instead of writing '{}'.
+            resultStr = JSON.stringify({ __empty: true });
+            hadResult = false;
+        } else {
+            resultStr = JSON.stringify(result);
+            hadResult = true;
+        }
 
-        // 1. Update message in DB
-        this.db.updateMessage(toolMessageId, {
+        const existing = this.db.getMessage(toolMessageId);
+        const toolName = existing?.tool_name || null;
+        const resultLen = resultStr ? resultStr.length : 0;
+
+        this._auditToolResult({
+            event: 'handleToolResult.enter',
+            conversationId,
+            toolMessageId,
+            toolName,
+            resultType: toolError ? 'error' : typeof result,
+            hadResult,
+            resultLen,
             status,
-            tool_result: resultStr,
-            processed_at: new Date().toISOString()
         });
+
+        if (!hadResult && !toolError) {
+            console.warn(`[ConversationManager] Tool ${toolName} (msg ${toolMessageId}) returned empty/undefined result — writing {"__empty":true}.`);
+        }
+
+        // 1. Update message in DB (with one retry on transient lock errors)
+        const write = () => {
+            this.db.updateMessage(toolMessageId, {
+                status,
+                tool_result: resultStr,
+                processed_at: new Date().toISOString()
+            });
+        };
+
+        let dbError = null;
+        let updateOk = false;
+        try {
+            write();
+            updateOk = true;
+        } catch (err) {
+            dbError = { name: err?.name, message: err?.message, code: err?.code };
+            console.error(`[ConversationManager] updateMessage failed for tool msg ${toolMessageId} (${toolName}); retrying after 100ms:`, dbError);
+            this._auditToolResult({
+                event: 'handleToolResult.update.throw',
+                conversationId,
+                toolMessageId,
+                toolName,
+                status,
+                dbError,
+            });
+            await this._sleep(100);
+            try {
+                write();
+                updateOk = true;
+                dbError = null;
+            } catch (err2) {
+                dbError = { name: err2?.name, message: err2?.message, code: err2?.code };
+                console.error(`[ConversationManager] updateMessage failed again for tool msg ${toolMessageId} (${toolName}):`, dbError);
+            }
+        }
+
+        this._auditToolResult({
+            event: updateOk ? 'handleToolResult.update.ok' : 'handleToolResult.update.failed',
+            conversationId,
+            toolMessageId,
+            toolName,
+            status,
+            hadResult,
+            resultLen,
+            dbError,
+        });
+
+        if (!updateOk) {
+            // Persist failed twice — rethrow so ToolProcessor._process's catch
+            // re-invokes handleToolResult with the error, which is audited too.
+            throw new Error(dbError?.message || 'updateMessage failed');
+        }
 
         // 2. Broadcast the updated message
         const updatedMsg = this.db.getMessage(toolMessageId);
