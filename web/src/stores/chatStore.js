@@ -260,14 +260,21 @@ class ChatStore {
       // remove any matching tool indicator that was used for live streaming UI.
       // This must run for ALL messages (new and updates): it's the status updates
       // (processing -> processed/error) that signal the end of the tool.
+      // Do NOT force isLoading=false while other tools are still running: the
+      // server's ai-status (handleAiStatus) is the source of truth and keeps the
+      // thinking indicator active until every tool has finished.
       if (message.role === 'tool' && message.tool_call_id) {
         const finalStates = ['processed', 'completed', 'error'];
         if (finalStates.includes(message.status)) {
           state.toolIndicators = state.toolIndicators.filter(
             t => t.toolCallId !== message.tool_call_id
           );
-          state.isLoading = false;
-          state.streamingMessage = '';
+          const hasRunning = state.toolIndicators.some(t => t.result === 'Running...');
+          const serverActive = ['queued', 'sending', 'ai_processing', 'tool_exec', 'tool_results', 'cancelling'].includes(state.aiStatus);
+          if (!hasRunning && !serverActive) {
+            state.isLoading = false;
+            state.streamingMessage = '';
+          }
         }
       }
     });
@@ -705,7 +712,11 @@ class ChatStore {
             // Safety net: descartar indicators já terminados que tenham ficado por limpar
             // (ex: broadcast perdido). Os tool indicators são só feedback in-flight;
             // as mensagens reais chegan via socket (message role='tool').
-            state.toolIndicators = [];
+            // Do NOT drop indicators that are still 'Running...': the loop may
+            // still be executing tools (cleared only on the terminal 'done' event).
+            if (!state.toolIndicators.some(t => t.result === 'Running...')) {
+              state.toolIndicators = [];
+            }
 
             // Create a message from finish events (content_filter, empty_content, etc.)
             const finishMessage = finishData?.content || '';

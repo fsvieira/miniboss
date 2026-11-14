@@ -53,7 +53,7 @@ const FOCUS_TRANSITIONS = {
   // finalizing -> finalizing_grace: give AI ONE LAST chance to send report
   'finalizing:tools_with_report':   { phase: 'report_sent', processing: 'idle',      hasTools: true },
   'finalizing:text_only':           { phase: 'finalizing_grace', processing: 'queued', hasTools: false },
-  'finalizing:tools_without_report':{ phase: 'finalizing_grace', processing: 'queued', hasTools: true },
+  'finalizing:tools_without_report':{ phase: 'finalizing_grace', processing: 'tool_exec', hasTools: true },
   'finalizing:iteration_exhausted': { phase: 'finalizing_grace', processing: 'queued', hasTools: false },
   'finalizing:error':               { phase: 'finalizing_grace', processing: 'queued', hasTools: false },
 
@@ -463,6 +463,7 @@ class ConversationManager {
         //    If hasTools===false, tools are ignored (ex: finalizing_grace
         //    where AI responded with non-report tools → completed).
         const toolCalls = this._parseToolCalls(message);
+        let createdTools = false;
         if (toolCalls.length > 0 && next.hasToolCalls) {
             let filteredToolCalls = toolCalls;
             if (conversation.conversation_type === 'focus') {
@@ -472,7 +473,7 @@ class ConversationManager {
                 }
             }
             this.createTools(conversation, filteredToolCalls);
-            this.toolProcessor.trigger();
+            createdTools = true;
         }
 
         // 5. Update conversation state (ONLY state write)
@@ -485,6 +486,14 @@ class ConversationManager {
             stateUpdate.focus_report = next.focusReport;
         }
         this.db.updateConversationState(conversationId, stateUpdate);
+
+        // 5b. Trigger the tool processor only AFTER the state (tool_exec/queued)
+        //     is persisted. This removes the race where the processor could start
+        //     a tool while the conversation is still marked 'queued' and the loop
+        //     could re-read it as claimable before the tools finish.
+        if (createdTools) {
+            this.toolProcessor.trigger();
+        }
 
         // 6. Broadcast state to UI
         const status = this.computeConversationStatus({ ...conversation, phase: next.phase, processing_state: next.processingState });
@@ -679,7 +688,9 @@ class ConversationManager {
             if (hasInvestigate) {
                 return this._makeState('waiting_focus', 'idle', max_iterations ?? 200, true);
             }
-            return this._makeState('active', 'queued', max_iterations ?? 200, true);
+            // While the tools run the conversation must be in 'tool_exec' (not
+            // 'queued'), so the loop never calls the AI again before the tools finish.
+            return this._makeState('active', 'tool_exec', max_iterations ?? 200, true);
         }
 
         if (event === EVENTS.TEXT_ONLY || event === EVENTS.AI_CALLED) {
@@ -876,6 +887,31 @@ class ConversationManager {
         if (currentConv.processing_state === PROCESSING_STATES.CANCELLING) {
             console.log(`[ConversationManager] Conversation ${conv.id} is cancelling; finalizing terminal state.`);
             this._finalizeCancel(currentConv);
+            return;
+        }
+
+        // --- Guard: only claimable states may call the AI. ---
+        // `conv` may be a stale 'queued' snapshot taken while tools were still
+        // running. Only 'queued' and 'tool_results' are claimable for an AI call;
+        // anything else (tool_exec, sending, ai_processing, idle, ...) means the
+        // loop must not launch the AI from here.
+        if (currentConv.processing_state !== PROCESSING_STATES.QUEUED
+            && currentConv.processing_state !== PROCESSING_STATES.TOOL_RESULTS) {
+            console.log(`[ConversationManager] Conversation ${conv.id} not claimable (state=${currentConv.processing_state}); skipping AI call.`);
+            return;
+        }
+
+        // --- Guard: never call the AI while tools are still running. ---
+        // The tool processor is a global sequential worker that can still be
+        // processing tool messages from this conversation even after the state
+        // was re-read. If any tool is pending/processing, keep the conversation
+        // in 'tool_exec' and bail without spending an iteration.
+        if (this.db.hasPendingToolsInConversation(conv.id)) {
+            if (currentConv.processing_state !== PROCESSING_STATES.TOOL_EXEC) {
+                this.db.updateProcessingState(conv.id, PROCESSING_STATES.TOOL_EXEC);
+            }
+            this.socketService.broadcastAIStatus(conv.id, PROCESSING_STATES.TOOL_EXEC);
+            console.log(`[ConversationManager] Conversation ${conv.id} has pending tools; staying in tool_exec, skipping AI call.`);
             return;
         }
 

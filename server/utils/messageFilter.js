@@ -154,13 +154,43 @@ function formatRunCommandToolContent(result) {
   return lines.join('\n');
 }
 
+/**
+ * A tool message is "complete" when it has a final status (anything other than
+ * pending/processing) or, in legacy rows with no status, a non-null
+ * tool_result/content. Incomplete tool messages must never reach the model.
+ */
+function isToolMessageComplete(m) {
+  if (!m) return false;
+  const status = m.status;
+  const hasResult = (m.tool_result !== null && m.tool_result !== undefined && String(m.tool_result) !== '')
+    || (m.content !== null && m.content !== undefined && String(m.content) !== '');
+  if (status && status !== 'pending' && status !== 'processing') return true;
+  if (!status) return hasResult;
+  return false;
+}
+
 function normalizeMessagesForLLM(messages) {
   if (!Array.isArray(messages)) return [];
+
+  // First pass: collect the tool_call_id of every tool message that has a final
+  // result, so the assistants below only keep tool_calls whose result actually
+  // exists. Orphan tool_calls (pending tools, or tools not created at all in
+  // terminal states) are invalid for the OpenAI API and must be dropped.
+  const completedToolCallIds = new Set();
+  for (const m of messages) {
+    if (!m || m.role !== 'tool' || !isToolMessageComplete(m)) continue;
+    const callId = m.tool_call_id || m.id;
+    if (callId) completedToolCallIds.add(String(callId));
+  }
 
   return messages.map((m) => {
     if (!m) return null;
 
     if (m.role === 'tool') {
+      if (!isToolMessageComplete(m)) {
+        return null;
+      }
+
       let rawContent = m.tool_result ?? m.content ?? '';
       if (rawContent === null || rawContent === undefined) rawContent = '';
       if (typeof rawContent !== 'string') {
@@ -220,11 +250,21 @@ function normalizeMessagesForLLM(messages) {
         }
       }
 
+      // Keep only tool_calls that have a completed tool message in the window.
+      // If none remain, omit the `tool_calls` property entirely (an empty array
+      // of tool_calls is invalid for the OpenAI API).
+      let keptToolCalls = null;
+      if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+        keptToolCalls = toolCalls.filter(
+          tc => tc.id && completedToolCallIds.has(String(tc.id))
+        );
+      }
+
       return {
         role: 'assistant',
         content: m.content || null,
-        ...(toolCalls && toolCalls.length ? {
-          tool_calls: toolCalls.map(tc => ({
+        ...(keptToolCalls && keptToolCalls.length ? {
+          tool_calls: keptToolCalls.map(tc => ({
             id: tc.id,
             type: tc.type === 'custom' ? 'custom' : 'function',
             function: tc.function || { name: '', arguments: '' },
