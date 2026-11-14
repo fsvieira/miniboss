@@ -110,6 +110,50 @@ function parseJsonSafe(payload) {
   }
 }
 
+/**
+ * Formats the result of `runCommand` as labelled text for the LLM.
+ *
+ * The raw JSON is kept in the database/UI; the model gets a plain-text layout
+ * that makes an empty stdout (with output on stderr) impossible to misread as
+ * "no output". Empty fields are omitted on purpose: a trailing `stderr:` label
+ * with nothing after it was what led the model to claim there was no output.
+ * Internal diagnostics (`captureSource`, `sandboxed`) are dropped.
+ *
+ * @param {Object} result
+ * @returns {string|null}
+ */
+function formatRunCommandToolContent(result) {
+  if (!result || typeof result !== 'object') return null;
+  if (!('stdout' in result) && !('stderr' in result) && !('exitCode' in result)) return null;
+
+  const stdout = result.stdout == null ? '' : String(result.stdout);
+  const stderr = result.stderr == null ? '' : String(result.stderr);
+  const exitCode = result.exitCode == null ? 0 : result.exitCode;
+
+  const lines = [`exitCode: ${exitCode}`];
+
+  if (stdout.trim() !== '') {
+    lines.push('stdout:', stdout);
+  }
+  if (stderr.trim() !== '') {
+    lines.push('stderr:', stderr);
+  }
+
+  if (stdout.trim() === '' && stderr.trim() !== '') {
+    lines.push('[stdout is empty; the output above is on stderr]');
+  } else if (stdout.trim() === '' && stderr.trim() === '') {
+    lines.push('[command produced no output]');
+  }
+
+  const setup = result.setup;
+  if (setup && setup.status === 'failed') {
+    const detail = setup.summary ? `: ${String(setup.summary).trim()}` : '';
+    lines.push(`[setup FAILED${detail}]`);
+  }
+
+  return lines.join('\n');
+}
+
 function normalizeMessagesForLLM(messages) {
   if (!Array.isArray(messages)) return [];
 
@@ -146,6 +190,10 @@ function normalizeMessagesForLLM(messages) {
       }
 
       let content = rawContent;
+      if (meta.toolName === 'runCommand') {
+        const formatted = formatRunCommandToolContent(parsed);
+        if (formatted != null) content = formatted;
+      }
       if (content.length > TOOL_CONTEXT_MAX_CHARS) {
         content = `${content.slice(0, TOOL_CONTEXT_MAX_CHARS)}\n\n[TRUNCATED — original tool result length ${rawContent.length} chars. Re-run the tool with narrower scope to retrieve the remainder.]`;
         meta.truncated = true;
@@ -196,4 +244,5 @@ function normalizeMessagesForLLM(messages) {
 module.exports = {
   filterMessagesForLLM,
   normalizeMessagesForLLM,
+  formatRunCommandToolContent,
 };

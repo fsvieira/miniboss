@@ -27,6 +27,10 @@ const GLOBAL_SETUP_MARKER_PATH = '/var/lib/miniboss/global-setup.done';
 const DEFAULT_IO_MOUNT_TARGET = '/var/lib/miniboss/io';
 const DEFAULT_SHM_SIZE = '1g';
 const DEFAULT_ULIMIT_STACK = '65536:65536';
+const DEFAULT_SETUP_TIMEOUT_MIN = 10;
+const DEFAULT_SETUP_RETRY_MIN = 5;
+const DEFAULT_CACHE_SUBDIR = 'cache';
+const DEFAULT_CACHE_KEY = '_default';
 const IO_KEY_MAX_LENGTH = 64;
 const CONTAINER_LABEL = 'miniboss';
 const CONTAINER_LABEL_VALUE = 'true';
@@ -56,6 +60,9 @@ function setSandboxImage(image) {
  */
 function getSandboxConfig() {
   const idleTtlMin = parseInt(process.env.SANDBOX_IDLE_TTL_MIN, 10);
+  const setupTimeoutMsRaw = parseInt(process.env.SANDBOX_SETUP_TIMEOUT_MS, 10);
+  const setupTimeoutMin = parseInt(process.env.SANDBOX_SETUP_TIMEOUT_MIN, 10);
+  const setupRetryMin = parseInt(process.env.SANDBOX_SETUP_RETRY_MIN, 10);
   return {
     runtime: getSandboxRuntime(),
     image: imageOverride || (process.env.SANDBOX_IMAGE || DEFAULT_IMAGE).trim(),
@@ -72,6 +79,22 @@ function getSandboxConfig() {
       path.join(getDataFolder(), 'sandbox', 'setup.sh')
     ).trim(),
     globalSetupMarkerPath: GLOBAL_SETUP_MARKER_PATH,
+    // Timeout of the global/repository setup scripts. A heavy setup must not
+    // block the command forever; the failure is recorded and retried only
+    // after the backoff below.
+    setupTimeoutMs:
+      (Number.isFinite(setupTimeoutMsRaw) && setupTimeoutMsRaw > 0
+        ? setupTimeoutMsRaw
+        : (Number.isFinite(setupTimeoutMin) && setupTimeoutMin > 0 ? setupTimeoutMin : DEFAULT_SETUP_TIMEOUT_MIN) * 60 * 1000),
+    setupRetryMs:
+      (Number.isFinite(setupRetryMin) && setupRetryMin > 0 ? setupRetryMin : DEFAULT_SETUP_RETRY_MIN) *
+      60 * 1000,
+    // Persistent cache shared between the golden container and the conversation
+    // sandboxes of the same project (Deno/npm/Playwright downloads…).
+    cacheDir: (
+      process.env.SANDBOX_CACHE_DIR ||
+      path.join(getDataFolder(), 'sandbox', DEFAULT_CACHE_SUBDIR)
+    ).trim(),
     // Output transport: the command writes stdout/stderr/exit-code into a file
     // inside the container; the host reads the files back (the exec stream is
     // only a fallback — it sometimes comes back empty).
@@ -161,6 +184,40 @@ function getSandboxStackLimit(config) {
 function getSandboxIoDir(conversationKey) {
   const config = getSandboxConfig();
   const dir = path.join(config.ioDir, sanitizeIoKey(conversationKey));
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+/**
+ * Resolves the sandbox image for a project.
+ *
+ * A project may have its own image (the "golden container" committed by the
+ * user); otherwise the global/default image is used.
+ *
+ * @param {string|null|undefined} projectImage
+ * @returns {string}
+ */
+function resolveSandboxImage(projectImage) {
+  const value = String(projectImage || '').trim();
+  return value || getSandboxConfig().image;
+}
+
+/**
+ * Persistent cache directory of a project (host side).
+ *
+ * The golden container and every conversation sandbox of the project mount the
+ * same directory at `${containerHome}/.cache`, so downloads survive container
+ * recreation. Conversations without a project use a shared `_default` cache.
+ *
+ * @param {number|string|null|undefined} projectId
+ * @returns {string} The absolute path of the directory.
+ */
+function getProjectSandboxCacheDir(projectId) {
+  const config = getSandboxConfig();
+  const key = projectId != null && String(projectId).trim() !== ''
+    ? `proj-${sanitizeIoKey(projectId)}`
+    : DEFAULT_CACHE_KEY;
+  const dir = path.join(config.cacheDir, key);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;
 }
@@ -270,4 +327,6 @@ module.exports = {
   getSandboxIoKey,
   getSandboxIoDir,
   getSandboxStackLimit,
+  getProjectSandboxCacheDir,
+  resolveSandboxImage,
 };

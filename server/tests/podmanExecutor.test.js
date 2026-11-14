@@ -13,6 +13,9 @@ const {
   buildExecArgs,
   buildCaptureCommand,
   buildStackLimitedCommand,
+  resolveSetupInterpreter,
+  detectSetupInterpreter,
+  shouldRetrySetup,
   resolveCapturedResult,
   waitForCapture,
   getCaptureStats,
@@ -164,13 +167,85 @@ async function runTests() {
     assert.notStrictEqual(a, b, 'the target is part of the container identity');
   });
 
+  // ── Persistent cache ────────────────────────────────────────────────────
+
+  check('the persistent cache is mounted read-write at the container cache', () => {
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-sandbox-cache-'));
+    try {
+      const mounts = buildMountMap({ repoRoot, worktreePath, cacheDir });
+      const cache = mounts.find(m => m.source === cacheDir);
+      assert.ok(cache, 'the cache directory must be mounted');
+      assert.strictEqual(cache.readOnly, false);
+      assert.strictEqual(cache.target, '/home/miniboss/.cache');
+    } finally {
+      fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+  });
+
+  // ── Setup interpreter ───────────────────────────────────────────────────
+
+  check('the setup interpreter follows the shebang', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-setup-'));
+    try {
+      const bashScript = path.join(dir, 'bash.sh');
+      fs.writeFileSync(bashScript, '#!/usr/bin/env bash\nset -euo pipefail\n', { mode: 0o644 });
+      assert.strictEqual(resolveSetupInterpreter(bashScript), 'bash');
+
+      const shScript = path.join(dir, 'sh.sh');
+      fs.writeFileSync(shScript, '#!/bin/sh\nset -e\n', { mode: 0o644 });
+      assert.strictEqual(resolveSetupInterpreter(shScript), 'sh');
+
+      const executable = path.join(dir, 'exec.sh');
+      fs.writeFileSync(executable, '#!/usr/bin/env bash\necho hi\n', { mode: 0o755 });
+      assert.strictEqual(resolveSetupInterpreter(executable), 'direct');
+
+      assert.strictEqual(detectSetupInterpreter('#!/usr/bin/env bash\n'), 'bash');
+      assert.strictEqual(detectSetupInterpreter('#!/bin/sh\n'), 'sh');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  check('a failed setup is retried only after the backoff or when forced', () => {
+    const now = 1000000;
+    const retryMs = 5 * 60 * 1000;
+    assert.strictEqual(shouldRetrySetup(null, now, retryMs), true, 'a new container retries');
+    assert.strictEqual(
+      shouldRetrySetup({ setupFailedAt: now - 1000 }, now, retryMs),
+      false,
+      'a recent failure is not retried'
+    );
+    assert.strictEqual(
+      shouldRetrySetup({ setupFailedAt: now - retryMs }, now, retryMs),
+      true,
+      'the backoff expires'
+    );
+    assert.strictEqual(
+      shouldRetrySetup({ setupFailedAt: now - 1000 }, now, retryMs, true),
+      true,
+      'a forced setup always retries'
+    );
+  });
+
   // ── Environment allowlist (D7) ──────────────────────────────────────────
 
   check('the container env is an explicit allowlist', () => {
     const env = buildContainerEnv({ exportPaths: [], configuredPaths: [] });
-    assert.deepStrictEqual(Object.keys(env).sort(), ['CI', 'HOME', 'LANG', 'PATH', 'TZ']);
+    assert.deepStrictEqual(
+      Object.keys(env).sort(),
+      ['CI', 'HOME', 'LANG', 'NPM_CONFIG_CACHE', 'PATH', 'TZ', 'XDG_CACHE_HOME']
+    );
     assert.strictEqual(env.CI, '1');
     assert.ok(env.PATH.includes('/usr/bin'));
+    assert.strictEqual(env.XDG_CACHE_HOME, '/home/miniboss/.cache');
+    assert.strictEqual(env.NPM_CONFIG_CACHE, '/home/miniboss/.cache/npm');
+  });
+
+  check('the worktree local bins are added to PATH', () => {
+    const env = buildContainerEnv({ worktreePath: '/test/worktree' });
+    const parts = env.PATH.split(':');
+    assert.ok(parts.includes('/test/worktree/.miniboss/bin'), 'the setup shims must be reachable');
+    assert.ok(parts.includes('/test/worktree/node_modules/.bin'), 'the node_modules bins must be reachable');
   });
 
   check('a configured path that is not exported is removed from PATH', () => {

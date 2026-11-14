@@ -235,4 +235,96 @@ router.post('/:projectId/conversations', (req, res) => {
     });
 });
 
+// ── Golden container (per-project console) ────────────────────────────────
+
+function loadProjectContainerContext(req, res) {
+  const project = db.getProject(req.params.id);
+  if (!project) {
+    res.status(404).json({ error: 'Project not found' });
+    return null;
+  }
+  if (!project.folder_path) {
+    res.status(400).json({ error: 'The project has no folder associated' });
+    return null;
+  }
+  return project;
+}
+
+function containerPayload(project, status) {
+  return {
+    projectId: project.id,
+    image: project.sandbox_image || null,
+    name: status.name,
+    exists: status.exists,
+    running: status.running,
+    status: status.status,
+    currentImage: status.image,
+    commands: {
+      enter: `podman exec -it --user root ${status.name} bash`,
+    },
+  };
+}
+
+// GET the golden container status of a project
+router.get('/:id/container', (req, res) => {
+  const project = loadProjectContainerContext(req, res);
+  if (!project) return;
+  try {
+    const { getGoldenContainerStatus } = require('../services/sandbox/podmanExecutor');
+    const status = getGoldenContainerStatus(project.id);
+    res.json(containerPayload(project, status));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST create/start the golden container
+router.post('/:id/container/start', (req, res) => {
+  const project = loadProjectContainerContext(req, res);
+  if (!project) return;
+  try {
+    const { ensureGoldenContainer, getGoldenContainerStatus } = require('../services/sandbox/podmanExecutor');
+    ensureGoldenContainer({
+      projectId: project.id,
+      repoRoot: project.folder_path,
+      image: project.sandbox_image || undefined,
+    });
+    res.json(containerPayload(project, getGoldenContainerStatus(project.id)));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST commit the golden container into the project image
+router.post('/:id/container/save', (req, res) => {
+  const project = loadProjectContainerContext(req, res);
+  if (!project) return;
+  try {
+    const { commitGoldenContainer, getGoldenContainerStatus } = require('../services/sandbox/podmanExecutor');
+    const image = commitGoldenContainer(project.id);
+    const updated = db.updateProject(project.id, { sandbox_image: image });
+    res.json(containerPayload(updated || project, getGoldenContainerStatus(project.id)));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST reset the golden container to the base image
+router.post('/:id/container/reset', (req, res) => {
+  const project = loadProjectContainerContext(req, res);
+  if (!project) return;
+  try {
+    const { resetGoldenContainer, getGoldenContainerStatus } = require('../services/sandbox/podmanExecutor');
+    const baseImage = req.body?.baseImage || null;
+    resetGoldenContainer(project.id, {
+      repoRoot: project.folder_path,
+      image: baseImage || undefined,
+    });
+    const updated = db.updateProject(project.id, { sandbox_image: null });
+    res.json(containerPayload(updated || project, getGoldenContainerStatus(project.id)));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

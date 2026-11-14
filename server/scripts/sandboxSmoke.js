@@ -100,15 +100,25 @@ async function main() {
   const setupScript = setupBody.replace(
     /^#!.*\n/,
     [
-      '#!/bin/sh',
+      '#!/usr/bin/env bash',
+      'set -euo pipefail',
       'echo "setup ran at $(date +%s)" >> /home/miniboss/setup-runs.log',
       'echo "setup-ok" > /home/miniboss/setup-marker',
       'echo "before=$(command -v sqlite3 || echo missing)" > /home/miniboss/tool-before',
+      'mkdir -p /home/miniboss/.cache',
+      'echo "cache-warm" > /home/miniboss/.cache/miniboss-smoke-cache',
       'echo "SETUP COMPLETED"',
       '',
     ].join('\n')
   );
-  fs.writeFileSync(path.join(setupDir, 'setup.sh'), setupScript, { mode: 0o755 });
+  // Non-executable on purpose: the runner must honor the bash shebang instead
+  // of forcing `sh` (which rejects `set -o pipefail`).
+  fs.writeFileSync(path.join(setupDir, 'setup.sh'), setupScript, { mode: 0o644 });
+
+  // A shim created by the host (not by the root setup) to prove the worktree
+  // `.miniboss/bin` is on PATH without leaving subuid-owned files behind.
+  fs.mkdirSync(path.join(setupDir, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(setupDir, 'bin', 'smoke-tool'), '#!/bin/sh\necho smoke-tool\n', { mode: 0o755 });
 
   const baseOpts = {
     repoRoot,
@@ -124,6 +134,11 @@ async function main() {
     const hello = await runPodmanCommand('echo hello-from-sandbox', worktreePath, 30000, baseOpts);
     assert('the command runs inside the container', hello.stdout.includes('hello-from-sandbox'), hello.stderr);
     assert('the command exits with 0', hello.exitCode === 0, `exit=${hello.exitCode} ${hello.stderr}`);
+    assert(
+      'the bash setup script ran successfully',
+      hello.setup && hello.setup.status === 'ok',
+      `setup=${JSON.stringify(hello.setup)}`
+    );
 
     // ── 2. The setup script ran ───────────────────────────────────────────
     const setupLog = await runPodmanCommand('cat /home/miniboss/setup-marker 2>/dev/null || echo missing', worktreePath, 30000, baseOpts);
@@ -258,6 +273,64 @@ async function main() {
       before.stdout.trim() === 'before=missing',
       `stdout=${before.stdout.trim()} (the global script must not provide sqlite3)`
     );
+
+    // ── 14. The setup shims are reachable through PATH ────────────────────
+    const shim = await runPodmanCommand('command -v smoke-tool', worktreePath, 30000, baseOpts);
+    assert(
+      'a binary installed in .miniboss/bin is on PATH',
+      String(shim.stdout || '').trim().endsWith('/.miniboss/bin/smoke-tool'),
+      `stdout=${shim.stdout} ${shim.stderr}`
+    );
+
+    // ── 15. The cache survives container recreation ───────────────────────
+    removeContainerForConversation(CONVERSATION_ID);
+    const cached = await runPodmanCommand('cat /home/miniboss/.cache/miniboss-smoke-cache', worktreePath, 30000, baseOpts);
+    assert(
+      'the persistent cache survives container recreation',
+      cached.stdout.includes('cache-warm'),
+      `stdout=${cached.stdout} ${cached.stderr}`
+    );
+
+    // ── 16. A failing setup is recorded and not retried on every command ──
+    const failWorktree = path.join(ROOT, 'fail-worktree');
+    fs.mkdirSync(path.join(failWorktree, '.miniboss'), { recursive: true });
+    fs.writeFileSync(
+      path.join(failWorktree, '.miniboss', 'setup.sh'),
+      [
+        '#!/bin/sh',
+        'echo run >> /home/miniboss/fail-runs',
+        'echo "setup boom" >&2',
+        'exit 3',
+        '',
+      ].join('\n'),
+      { mode: 0o644 }
+    );
+    const failOpts = {
+      ...baseOpts,
+      worktreePath: failWorktree,
+      conversationId: `smoke-fail-${process.pid}`,
+    };
+    const failFirst = await runPodmanCommand('echo ok', failWorktree, 30000, failOpts);
+    assert(
+      'a failing setup is reported as setup.status = failed',
+      failFirst.setup && failFirst.setup.status === 'failed',
+      `setup=${JSON.stringify(failFirst.setup)}`
+    );
+    assert(
+      'the setup failure does not flood the command stderr',
+      !String(failFirst.stderr || '').includes('setup boom'),
+      `stderr=${failFirst.stderr}`
+    );
+    const failSecond = await runPodmanCommand('echo ok', failWorktree, 30000, failOpts);
+    assert('the command still runs after a failed setup', failSecond.exitCode === 0, failSecond.stderr);
+    const failRunsOutput = await runPodmanCommand('wc -l < /home/miniboss/fail-runs', failWorktree, 30000, failOpts);
+    const failRuns = parseInt(String(failRunsOutput.stdout || '').trim(), 10);
+    assert(
+      'a failed setup is not retried within the backoff window',
+      failRuns === 1,
+      `runs=${failRuns}`
+    );
+    removeContainerForConversation(`smoke-fail-${process.pid}`);
   } finally {
     try {
       removeContainerForConversation(CONVERSATION_ID);

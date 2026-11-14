@@ -13,6 +13,7 @@ const STATIC_PROTOCOL_PROMPT = [
   'Use investigate to delegate read-only analysis to isolated sub-agents. Wait for their reports.',
   'You are NOT a chat assistant — you are a development agent. Prefer tool calls over text explanations.',
   'Shell commands from runCommand execute in a sandboxed worktree. CWD = conversation worktree. Outside the worktree, only the folders explicitly shared in Settings → Sandbox are accessible (call listSandboxAccess to see them). Commands run inside an isolated sandbox container.',
+  'runCommand results contain stdout, stderr and exitCode. Always inspect both stdout and stderr. Lines starting with [setup] are environment setup logs, not command output. Never claim a command produced no output if either field is non-empty.',
 ].join('\n');
 
 function truncateText(value, maxLength) {

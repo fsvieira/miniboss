@@ -35,6 +35,7 @@ db.exec(`
      id INTEGER PRIMARY KEY AUTOINCREMENT,
      name TEXT NOT NULL,
      folder_path TEXT,
+     sandbox_image TEXT,
      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
    );
@@ -205,6 +206,11 @@ if (currentMessagesTableInfo && currentMessagesTableInfo.sql && !currentMessages
 const projectsColumns = db.prepare("PRAGMA table_info(projects)").all().map(col => col.name);
 if (!projectsColumns.includes('folder_path')) {
   db.prepare("ALTER TABLE projects ADD COLUMN folder_path TEXT").run();
+}
+
+// Migration for projects table: add sandbox_image column (golden container image)
+if (!projectsColumns.includes('sandbox_image')) {
+  db.prepare("ALTER TABLE projects ADD COLUMN sandbox_image TEXT").run();
 }
 
 // Migration for conversations table: add last_summarized_at column

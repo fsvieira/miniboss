@@ -413,7 +413,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
       type: "function",
       function: {
         name: "runCommand",
-        description: `Execute a shell command. CWD = "${workingDir}". PREFER ABSOLUTE PATHS to avoid ambiguity — use the CWD above as your base. Relative paths work (resolved from CWD) but avoid relative path traversal (e.g. '../data/chat.db' might leave the worktree). Runs inside an isolated sandbox container. Supports optional timeout (ms). Use this for running tests, builds, lints, or other development tasks. The command output will be returned as the result.`,
+        description: `Execute a shell command. CWD = "${workingDir}". PREFER ABSOLUTE PATHS to avoid ambiguity — use the CWD above as your base. Relative paths work (resolved from CWD) but avoid relative path traversal (e.g. '../data/chat.db' might leave the worktree). Runs inside an isolated sandbox container. Supports optional timeout (ms). Use this for running tests, builds, lints, or other development tasks. The result is a JSON object with stdout, stderr and exitCode. Read BOTH stdout and stderr. An empty stdout does not mean the command produced no output.`,
         parameters: {
           type: "object",
           properties: {

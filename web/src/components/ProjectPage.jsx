@@ -32,6 +32,12 @@ import {
   updateConversation,
   getConversations,
 } from '../api/conversations';
+import {
+  getProjectContainer,
+  startProjectContainer,
+  saveProjectContainer,
+  resetProjectContainer,
+} from '../api/sandbox';
 
 function TabPanel({ value, index, children }) {
   if (value !== index) return null;
@@ -66,6 +72,8 @@ export default function ProjectPage({
   const [selectedExtraFiles, setSelectedExtraFiles] = useState([]);
   const [extraSearchTerm, setExtraSearchTerm] = useState('');
   const [loadingExtraSearch, setLoadingExtraSearch] = useState(false);
+  const [containerInfo, setContainerInfo] = useState(null);
+  const [containerBusy, setContainerBusy] = useState(false);
 
   // Sincronizar estado local quando o projecto muda (evita ficar com dados do projecto anterior)
   useEffect(() => {
@@ -100,6 +108,34 @@ export default function ProjectPage({
       loadSelectedExtraFiles();
     }
   }, [tabValue, project?.id]);
+
+  // Carregar o estado do container dourado quando muda para a aba Container
+  useEffect(() => {
+    if (tabValue === 3 && project?.id) {
+      loadContainer();
+    }
+  }, [tabValue, project?.id]);
+
+  async function loadContainer() {
+    try {
+      const info = await getProjectContainer(project.id);
+      setContainerInfo(info);
+    } catch (error) {
+      console.error('Failed to load project container:', error);
+    }
+  }
+
+  async function handleContainerAction(action) {
+    setContainerBusy(true);
+    try {
+      const info = await action(project.id);
+      setContainerInfo(info);
+      setToast({ message: 'Container updated.', severity: 'success' });
+    } catch (error) {
+      setToast({ message: error.message, severity: 'error' });
+    }
+    setContainerBusy(false);
+  }
 
   const loadSelectedExtraFiles = async () => {
     try {
@@ -271,6 +307,7 @@ export default function ProjectPage({
           <Tab label="Settings" />
           <Tab label="Conversations" />
           <Tab label="Extra Files" />
+          <Tab label="Container" />
         </Tabs>
       </Box>
 
@@ -499,16 +536,74 @@ export default function ProjectPage({
              </List>
            )}
 
-           <Button
-             variant="contained"
-             sx={{ mt: 2 }}
-             onClick={handleSaveExtraFiles}
-             disabled={selectedExtraFiles.length === 0}
-           >
-             Save Selection
-           </Button>
-         </TabPanel>
-       </Box>
+            <Button
+              variant="contained"
+              sx={{ mt: 2 }}
+              onClick={handleSaveExtraFiles}
+              disabled={selectedExtraFiles.length === 0}
+            >
+              Save Selection
+            </Button>
+          </TabPanel>
+
+          {/* ── TAB 3: Container (golden image) ── */}
+          <TabPanel value={tabValue} index={3}>
+            <Typography variant="subtitle1" sx={{ mb: 2, fontWeight: 600 }}>
+              Container
+            </Typography>
+
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              A console do projeto. Entre por uma consola Linux do host, instale o que precisa
+              (por exemplo <code>bash .miniboss/setup.sh</code>) e guarde como imagem do projeto.
+              As conversas passam a ser criadas a partir dessa imagem; as existentes são recriadas
+              no próximo comando.
+            </Typography>
+
+            {containerInfo ? (
+              <Box sx={{ mb: 2 }}>
+                <Typography variant="body2" sx={{ mb: 0.5 }}>
+                  <strong>Container:</strong> {containerInfo.name}{' '}
+                  ({containerInfo.running ? 'a correr' : containerInfo.exists ? 'parado' : 'não criado'})
+                </Typography>
+                <Typography variant="body2" sx={{ mb: 0.5 }}>
+                  <strong>Imagem do projeto:</strong> {containerInfo.image || 'imagem base'}
+                </Typography>
+                <Typography variant="body2" component="pre" sx={{ mt: 1, p: 1, bgcolor: 'action.hover', borderRadius: 1, fontSize: '0.8rem' }}>
+                  {containerInfo.commands?.enter}
+                </Typography>
+              </Box>
+            ) : (
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                A carregar o estado do container…
+              </Typography>
+            )}
+
+            <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+              <Button
+                variant="contained"
+                disabled={containerBusy}
+                onClick={() => handleContainerAction(startProjectContainer)}
+              >
+                Criar / Arrancar
+              </Button>
+              <Button
+                variant="outlined"
+                disabled={containerBusy || !containerInfo?.exists}
+                onClick={() => handleContainerAction(saveProjectContainer)}
+              >
+                Guardar como imagem do projeto
+              </Button>
+              <Button
+                variant="outlined"
+                color="warning"
+                disabled={containerBusy}
+                onClick={() => handleContainerAction(resetProjectContainer)}
+              >
+                Repor
+              </Button>
+            </Box>
+          </TabPanel>
+        </Box>
 
       {/* ── Toast ── */}
       <Snackbar

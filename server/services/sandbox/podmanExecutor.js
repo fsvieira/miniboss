@@ -12,6 +12,8 @@ const {
   getSandboxIoDir,
   getSandboxIoKey,
   getSandboxStackLimit,
+  getProjectSandboxCacheDir,
+  resolveSandboxImage,
 } = require('./runtime');
 
 /**
@@ -68,7 +70,7 @@ const INIT_COMMAND = 'trap "kill -TERM 0" TERM INT; sleep infinity & wait';
  * It is part of the container identity: when it changes, the containers created
  * by an older version of MiniBoss are recreated instead of being reused.
  */
-const CONTAINER_SPEC_VERSION = '3';
+const CONTAINER_SPEC_VERSION = '4';
 
 /** @type {Map<string, Object>} conversationId -> container state */
 const containerStates = new Map();
@@ -88,6 +90,7 @@ const lastActivity = new Map();
  * @param {Array<{path: string, writable: boolean}>} [params.extraPaths]
  * @param {string} [params.ioDir] - Host directory of the output exchange.
  * @param {string} [params.ioTarget] - Mount point of the exchange inside the container.
+ * @param {string} [params.cacheDir] - Host directory of the persistent cache.
  * @returns {Array<{source: string, target: string, readOnly: boolean}>}
  */
 function buildMountMap(params = {}) {
@@ -98,6 +101,7 @@ function buildMountMap(params = {}) {
     extraPaths = [],
     ioDir = null,
     ioTarget = null,
+    cacheDir = null,
   } = params;
 
   const mounts = [];
@@ -130,6 +134,18 @@ function buildMountMap(params = {}) {
       continue;
     }
     push(resolved, !(entry.writable === true || entry.access_mode === 'write'));
+  }
+
+  // Persistent cache (Deno/npm/Playwright downloads…): it lives on the host so
+  // it survives the container recreation. The golden container of the project
+  // mounts the same directory, so what it warms is reused by the sandboxes.
+  if (cacheDir) {
+    const resolvedCache = path.resolve(cacheDir);
+    if (fs.existsSync(resolvedCache)) {
+      push(resolvedCache, false, path.posix.join(getSandboxConfig().containerHome, '.cache'));
+    } else {
+      console.warn(`[podmanExecutor] Skipping sandbox cache directory (does not exist): ${resolvedCache}`);
+    }
   }
 
   // The output exchange: the command writes stdout/stderr/exit-code there and
@@ -173,6 +189,7 @@ function buildMountsKey(mounts) {
  * @param {Object} params
  * @param {Array<string>} [params.exportPaths] - Sandbox paths exported to PATH.
  * @param {Array<string>} [params.configuredPaths] - Every configured sandbox path.
+ * @param {string} [params.worktreePath] - Worktree whose local bins are added to PATH.
  * @returns {Object}
  */
 function buildContainerEnv(params = {}) {
@@ -191,12 +208,28 @@ function buildContainerEnv(params = {}) {
     if (p && !merged.includes(p)) merged.push(p);
   }
 
+  // Project-local binaries (the setup script often installs shims there) and
+  // the node_modules bins must be reachable by every command, not only by the
+  // setup process. A non-existent directory in PATH is harmless.
+  if (params.worktreePath) {
+    const localBins = [
+      path.join(params.worktreePath, '.miniboss', 'bin'),
+      path.join(params.worktreePath, 'node_modules', '.bin'),
+    ];
+    for (const p of localBins) {
+      if (!merged.includes(p)) merged.push(p);
+    }
+  }
+
+  const cacheHome = path.posix.join(config.containerHome, '.cache');
   return {
     HOME: config.containerHome,
     PATH: merged.join(':'),
     LANG: process.env.LANG || 'C.UTF-8',
     TZ: process.env.TZ || 'UTC',
     CI: '1',
+    XDG_CACHE_HOME: cacheHome,
+    NPM_CONFIG_CACHE: path.posix.join(cacheHome, 'npm'),
   };
 }
 
@@ -712,29 +745,44 @@ function containerNameFor(conversationId) {
 /**
  * Inspects a container.
  * @param {string} name
- * @returns {{exists: boolean, running: boolean, labels: Object, mountsKey: string|null}|null}
+ * @returns {{exists: boolean, running: boolean, status: string, labels: Object, mountsKey: string|null, image: string|null, spec: string|null}|null}
  */
 function inspectContainer(name) {
-  const result = runPodmanSync([
+  const inspectArgs = [
     'inspect', name,
-    '--format', '{{.State.Status}}|{{index .Config.Labels "miniboss.mounts"}}',
-  ], { timeoutMs: 20000 });
+    '--format',
+    '{{.State.Status}}|{{index .Config.Labels "miniboss.mounts"}}|{{index .Config.Labels "miniboss.image"}}|{{index .Config.Labels "miniboss.spec"}}',
+  ];
+
+  let result = runPodmanSync(inspectArgs, { timeoutMs: 20000 });
+  if (result.exitCode !== 0 && !isContainerMissingError(result.stderr)) {
+    // A transient podman failure (timeout, D-Bus…) must not be mistaken for a
+    // missing container: retry once, and never recreate the container blindly.
+    result = runPodmanSync(inspectArgs, { timeoutMs: 20000 });
+    if (result.exitCode !== 0 && !isContainerMissingError(result.stderr)) {
+      throw new Error(
+        `Failed to inspect sandbox container ${name}: ${String(result.stderr || result.stdout || '').trim() || `exit code ${result.exitCode}`}`
+      );
+    }
+  }
 
   if (result.exitCode !== 0) return null;
 
-  const [status, mountsKey] = String(result.stdout || '').trim().split('|');
+  const [status, mountsKey, image, spec] = String(result.stdout || '').trim().split('|');
   return {
     exists: true,
     running: status === 'running',
     status,
     mountsKey: mountsKey && mountsKey !== '' ? mountsKey : null,
+    image: image && image !== '' ? image : null,
+    spec: spec && spec !== '' ? spec : null,
   };
 }
 
 /**
  * Ensures the container for a conversation exists, is running and has the
- * expected mount map. Recreates it when the mounts changed (the mount map is
- * fixed at `create` time).
+ * expected mount map. Recreates it when the mounts, the image or the container
+ * specification changed (all of them are fixed at `create` time).
  *
  * @param {Object} params
  * @param {number|string} params.conversationId
@@ -746,7 +794,11 @@ function inspectContainer(name) {
  * @param {Array<string>} [params.configuredPaths]
  * @param {string} [params.ioDir] - Host directory of the output exchange.
  * @param {string} [params.ioTarget] - Mount point of the exchange inside the container.
- * @returns {Promise<{name: string, created: boolean, started: boolean, setupLog: string|null}>}
+ * @param {number|string} [params.projectId] - Project of the conversation (cache + image).
+ * @param {string} [params.image] - Resolved image (defaults to the global one).
+ * @param {string} [params.cacheDir] - Host directory of the persistent cache.
+ * @param {boolean} [params.forceSetup] - Run the setup even if it failed recently.
+ * @returns {Promise<{name: string, created: boolean, started: boolean, setupLog: string|null, setup: Object}>}
  */
 async function ensureContainer(params = {}) {
   const config = getSandboxConfig();
@@ -760,53 +812,79 @@ async function ensureContainer(params = {}) {
     configuredPaths = [],
     ioDir = null,
     ioTarget = config.ioMountTarget,
+    projectId = null,
+    forceSetup = false,
   } = params;
 
+  const image = resolveSandboxImage(params.image);
+  const cacheDir = params.cacheDir || getProjectSandboxCacheDir(projectId);
   const name = containerNameFor(conversationId);
-  const mounts = buildMountMap({ repoRoot, worktreePath, readOnlyWorktree, extraPaths, ioDir, ioTarget });
+  const stateKey = String(conversationId);
+  const mounts = buildMountMap({
+    repoRoot,
+    worktreePath,
+    readOnlyWorktree,
+    extraPaths,
+    ioDir,
+    ioTarget,
+    cacheDir,
+  });
   const mountsKey = buildMountsKey(mounts);
 
-  const env = buildContainerEnv({ exportPaths, configuredPaths });
+  const env = buildContainerEnv({
+    exportPaths,
+    configuredPaths,
+    worktreePath: worktreePath || repoRoot,
+  });
   const labels = {
     [config.label]: config.labelValue,
     'miniboss.conversation': String(conversationId),
     'miniboss.worktree': worktreePath || repoRoot || '',
     'miniboss.mounts': mountsKey,
+    'miniboss.image': image,
+    'miniboss.spec': CONTAINER_SPEC_VERSION,
   };
 
   const info = inspectContainer(name);
   let created = false;
   let started = false;
 
-  if (info && info.mountsKey && info.mountsKey !== mountsKey) {
-    // The mount map is fixed at create time — the container must be recreated.
-    console.log(`[podmanExecutor] Recreating container ${name} (mount map changed)`);
-    runPodmanSync(['rm', '-f', name], { timeoutMs: 30000 });
-    containerStates.delete(String(conversationId));
+  const recreateReasons = [];
+  if (info) {
+    if (info.mountsKey !== mountsKey) recreateReasons.push('mount map changed');
+    if (info.image !== image) recreateReasons.push('image changed');
+    if (info.spec !== CONTAINER_SPEC_VERSION) recreateReasons.push('spec changed');
   }
 
-  if (!info || info.mountsKey !== mountsKey) {
+  if (info && recreateReasons.length > 0) {
+    // These properties are fixed at create time — the container must be recreated.
+    console.log(`[podmanExecutor] Recreating container ${name} (${recreateReasons.join(', ')})`);
+    runPodmanSync(['rm', '-f', name], { timeoutMs: 30000 });
+    containerStates.delete(stateKey);
+  }
+
+  if (!info || recreateReasons.length > 0) {
     const createArgs = buildCreateArgs({
       name,
-      image: config.image,
+      image,
       mounts,
       env,
       labels,
       workdir: worktreePath || repoRoot,
       network: config.network,
     });
-    const created_result = runPodmanSync(createArgs, { timeoutMs: 10 * 60 * 1000 });
-    if (created_result.exitCode !== 0) {
-      const stderr = String(created_result.stderr || '').trim();
+    const createdResult = runPodmanSync(createArgs, { timeoutMs: 10 * 60 * 1000 });
+    if (createdResult.exitCode !== 0) {
+      const stderr = String(createdResult.stderr || '').trim();
       if (isImageMissingError(stderr)) {
-        await pullImage(config.image);
+        await pullImage(image);
         const retry = runPodmanSync(createArgs, { timeoutMs: 10 * 60 * 1000 });
         if (retry.exitCode !== 0) {
           throw new Error(`Failed to create sandbox container: ${String(retry.stderr || retry.stdout).trim()}`);
         }
       } else {
         throw new Error(
-          `Failed to create sandbox container: ${stderr || created_result.stdout || `exit code ${created_result.exitCode}`}`
+          `Failed to create sandbox container: ${stderr || createdResult.stdout || `exit code ${createdResult.exitCode}`}`
         );
       }
     }
@@ -822,26 +900,103 @@ async function ensureContainer(params = {}) {
     started = true;
   }
 
-  // Prepare the container HOME (the npm cache lives there), the output
-  // exchange directory and detect the in-container timeout binary.
+  // Prepare the container HOME (the cache lives there), the output exchange
+  // directory and detect the in-container timeout binary.
   const prepared = await prepareContainer(name, env, ioTarget);
 
-  // Run the global setup script (CLI tools) and the repository setup script,
-  // each of them exactly once per container.
+  // Setup backoff: a setup that just failed must not be retried on every
+  // command (the apt/npm log would flood stderr). It is retried when the
+  // container is recreated, after the backoff, or when explicitly forced.
+  const previousState = containerStates.get(stateKey) || null;
+  const canRetrySetup = shouldRetrySetup(previousState, Date.now(), config.setupRetryMs, forceSetup);
+
   let setupLog = null;
-  if (!prepared.globalSetupDone) {
-    setupLog = await runGlobalSetupScript(name);
-  }
-  if (!prepared.setupDone) {
-    const repoSetupLog = await runSetupScript(name, worktreePath || repoRoot);
-    setupLog = [setupLog, repoSetupLog].filter(Boolean).join('\n');
+  let setup = { status: 'skipped', exitCode: 0, summary: null };
+  let setupFailedAt = previousState ? previousState.setupFailedAt || null : null;
+
+  if (!canRetrySetup && previousState && previousState.setupStatus === 'failed') {
+    // Still inside the backoff window: report the last failure without running
+    // the setup again. The original timestamp is preserved so the backoff can
+    // actually expire.
+    setup = {
+      status: 'failed',
+      exitCode: previousState.setupExitCode || 0,
+      summary: previousState.setupSummary || null,
+    };
+    setupLog = previousState.setupLog || null;
+  } else {
+    const logs = [];
+    let failed = null;
+    let ran = false;
+    let repoSkippedReadOnly = false;
+
+    if (!prepared.globalSetupDone && config.globalSetupEnabled && fs.existsSync(config.globalSetupScript)) {
+      ran = true;
+      const global = await runGlobalSetupScript(name, { timeoutMs: config.setupTimeoutMs });
+      if (global.log) logs.push(global.log);
+      if (!global.ok) failed = global;
+    }
+
+    // The repository setup writes project shims (`.miniboss/bin/deno`,
+    // node_modules…) into the worktree. On a read-only worktree (project / plan
+    // conversations) those writes fail by design, so the script is skipped
+    // instead of failing: its tools must come from the project image, not from
+    // a setup that cannot write.
+    const repoSetupPath = path.join(worktreePath || repoRoot, config.setupScript);
+    if (!failed && !prepared.setupDone && fs.existsSync(repoSetupPath)) {
+      if (readOnlyWorktree) {
+        repoSkippedReadOnly = true;
+      } else {
+        ran = true;
+        const repo = await runSetupScript(name, worktreePath || repoRoot, {
+          timeoutMs: config.setupTimeoutMs,
+          env,
+        });
+        if (repo.log) logs.push(repo.log);
+        if (!repo.ok) failed = repo;
+      }
+    }
+
+    setupLog = logs.filter(Boolean).join('\n') || null;
+    if (failed) {
+      setup = {
+        status: 'failed',
+        exitCode: failed.exitCode || 0,
+        summary: buildSetupSummary(setupLog),
+      };
+      setupFailedAt = Date.now();
+    } else if (ran) {
+      setup = { status: 'ok', exitCode: 0, summary: null };
+      setupFailedAt = null;
+    } else {
+      setup = {
+        status: 'skipped',
+        exitCode: 0,
+        summary: repoSkippedReadOnly
+          ? '[setup skipped: read-only worktree — tools must be provided by the project image]'
+          : null,
+      };
+      setupFailedAt = null;
+    }
+
+    if (ran) {
+      // The setup runs as root (it needs apt), but the container root maps to a
+      // subuid: the files it creates in the worktree/cache would be owned by a
+      // stranger on the host. Give them back to the host user.
+      repairSetupOwnership(name, env, worktreePath || repoRoot);
+    }
   }
 
-  containerStates.set(String(conversationId), {
+  containerStates.set(stateKey, {
     name,
     mountsKey,
+    image,
     env,
     setupLog,
+    setupStatus: setup.status,
+    setupExitCode: setup.exitCode,
+    setupSummary: setup.summary,
+    setupFailedAt,
     timeoutBinary: prepared.timeoutBinary,
     ioDir,
     ioTarget,
@@ -849,7 +1004,65 @@ async function ensureContainer(params = {}) {
 
   lastActivity.set(name, Date.now());
 
-  return { name, created, started, setupLog };
+  return { name, created, started, setupLog, setup };
+}
+
+/**
+ * Gives the files created by the root setup back to the host user.
+ *
+ * `--userns=keep-id` maps the container root to a subuid, so a setup that runs
+ * as root would leave the worktree shims and the persistent cache owned by a
+ * stranger on the host (the user could no longer edit or delete them).
+ *
+ * @param {string} name
+ * @param {Object} env
+ * @param {string} [worktreePath]
+ */
+function repairSetupOwnership(name, env, worktreePath) {
+  const uid = String(os.userInfo().uid);
+  const targets = [path.posix.join(env.HOME, '.cache')];
+  if (worktreePath) {
+    targets.push(path.posix.join(worktreePath, '.miniboss'));
+    targets.push(path.posix.join(worktreePath, 'node_modules'));
+  }
+  const command = targets
+    .map(target => `[ -e ${shellQuote(target)} ] && chown -R ${uid} ${shellQuote(target)} || true`)
+    .join('; ');
+  runPodmanSync([
+    'exec', '--user', 'root', name, '/bin/sh', '-c', command,
+  ], { timeoutMs: 120000 });
+}
+
+/**
+ * Whether the setup may run again.
+ *
+ * A failed setup is not retried on every command: it is retried when the
+ * container is recreated (no previous state), after the backoff, or when the
+ * user forces it.
+ *
+ * @param {Object|null} previousState
+ * @param {number} now
+ * @param {number} retryMs
+ * @param {boolean} [force]
+ * @returns {boolean}
+ */
+function shouldRetrySetup(previousState, now, retryMs, force = false) {
+  if (force) return true;
+  if (!previousState || !previousState.setupFailedAt) return true;
+  return now - previousState.setupFailedAt >= retryMs;
+}
+
+/**
+ * Builds the short summary of a setup log (the last lines, bounded).
+ * @param {string|null} log
+ * @param {number} [maxChars]
+ * @returns {string|null}
+ */
+function buildSetupSummary(log, maxChars = 1200) {
+  const text = String(log || '').trim();
+  if (!text) return null;
+  if (text.length <= maxChars) return text;
+  return `…${text.slice(-maxChars)}`;
 }
 
 /**
@@ -869,32 +1082,56 @@ async function prepareContainer(name, env, ioTarget) {
     // already there (and it creates the parent when the mount is missing).
     parts.push(`mkdir -p ${shellQuote(ioTarget)}`);
   }
-  parts.push('command -v timeout || true');
 
   // Runs as the container root: the container root is mapped to the host user
   // (keep-id), so the HOME directory belongs to the user and not to root.
-  const result = await runPodmanProcess(buildExecArgs({ name, env, command: parts.join('; '), user: 'root' }), 30000);
-  const output = `${result.stdout || ''}`.trim();
-  const setupDone = await isSetupDone(name, config.setupMarkerPath);
-  const globalSetupDone = await isSetupDone(name, config.globalSetupMarkerPath);
+  await runPodmanProcess(buildExecArgs({ name, env, command: parts.join('; '), user: 'root' }), 30000);
+  const timeoutBinary = detectTimeoutBinary(name, env);
+  const setupDone = isSetupDone(name, config.setupMarkerPath);
+  const globalSetupDone = isSetupDone(name, config.globalSetupMarkerPath);
   return {
-    timeoutBinary: output && output.startsWith('/') ? output : null,
+    timeoutBinary,
     setupDone,
     globalSetupDone,
   };
 }
 
 /**
+ * Detects the `timeout` binary inside the container using exit codes.
+ *
+ * stdout of `podman exec` is not reliable (it intermittently comes back
+ * empty), so the detection must never depend on it.
+ *
+ * @param {string} name
+ * @param {Object} env
+ * @returns {string|null} The absolute path of the binary, or null.
+ */
+function detectTimeoutBinary(name, env) {
+  const result = runPodmanSync([
+    'exec', name, '/bin/sh', '-c',
+    'if [ -x /usr/bin/timeout ]; then exit 0; elif [ -x /bin/timeout ]; then exit 2; else exit 1; fi',
+  ], { timeoutMs: 20000 });
+  if (result.exitCode === 0) return '/usr/bin/timeout';
+  if (result.exitCode === 2) return '/bin/timeout';
+  return null;
+}
+
+/**
  * Whether a setup script already ran in this container.
+ *
+ * The decision uses the exit code of `test -f`, never stdout: the `podman exec`
+ * stream intermittently comes back empty and would make the setup run again on
+ * every command.
+ *
  * @param {string} name
  * @param {string} markerPath
  */
-async function isSetupDone(name, markerPath) {
+function isSetupDone(name, markerPath) {
   const result = runPodmanSync([
     'exec', name, '/bin/sh', '-c',
-    `test -f ${shellQuote(markerPath)} && echo yes || echo no`,
+    `test -f ${shellQuote(markerPath)}`,
   ], { timeoutMs: 20000 });
-  return String(result.stdout || '').trim() === 'yes';
+  return result.exitCode === 0;
 }
 
 /**
@@ -957,18 +1194,51 @@ function ensureGlobalSetupScript() {
 }
 
 /**
+ * Detects the interpreter declared by the shebang of a setup script.
+ * @param {string} content
+ * @returns {'bash'|'sh'}
+ */
+function detectSetupInterpreter(content) {
+  const firstLine = String(content || '').split('\n')[0] || '';
+  return /\bbash\b/.test(firstLine) ? 'bash' : 'sh';
+}
+
+/**
+ * Resolves how a setup script must be invoked.
+ *
+ * - `direct`: the script is executable — run it as `./script`, so the kernel
+ *   honors its shebang (bash scripts with `set -o pipefail` work).
+ * - `bash`/`sh`: the script is not executable — run it with the interpreter
+ *   declared by its shebang (never force `sh` on a bash script).
+ *
+ * @param {string} scriptPath
+ * @returns {'direct'|'bash'|'sh'}
+ */
+function resolveSetupInterpreter(scriptPath) {
+  try {
+    const stat = fs.statSync(scriptPath);
+    if ((stat.mode & 0o111) !== 0) return 'direct';
+    return detectSetupInterpreter(fs.readFileSync(scriptPath, 'utf8'));
+  } catch (_) {
+    return 'sh';
+  }
+}
+
+/**
  * Runs the global setup script inside the container (once per container).
  *
  * The script is passed inline (base64) so no extra mount is needed and the
  * stdin of `podman exec` stays untouched. A failing setup never breaks the
- * container: the failure is logged and surfaced in the first `runCommand`.
+ * container: the failure is returned so it can be recorded and surfaced
+ * without flooding the stderr of every command.
  *
  * @param {string} name - Container name.
- * @returns {Promise<string|null>}
+ * @param {{timeoutMs?: number}} [options]
+ * @returns {Promise<{ok: boolean, log: string|null, exitCode: number}>}
  */
-async function runGlobalSetupScript(name) {
+async function runGlobalSetupScript(name, options = {}) {
   const config = getSandboxConfig();
-  if (!config.globalSetupEnabled) return null;
+  if (!config.globalSetupEnabled) return { ok: true, log: null, exitCode: 0 };
 
   // The default script is written on demand, so the setup also works when the
   // server was not restarted after the feature was enabled.
@@ -977,15 +1247,21 @@ async function runGlobalSetupScript(name) {
   const scriptPath = config.globalSetupScript;
   if (!fs.existsSync(scriptPath)) {
     console.warn(`[podmanExecutor] Global setup script not found: ${scriptPath}`);
-    return null;
+    return { ok: true, log: null, exitCode: 0 };
   }
 
   const script = fs.readFileSync(scriptPath, 'utf8');
   const encoded = Buffer.from(script, 'utf8').toString('base64');
   const env = buildContainerEnv({});
-  const command = `printf %s ${shellQuote(encoded)} | base64 -d | sh`;
+  // The script is piped into the interpreter, so the shebang is only a hint.
+  const interpreter = detectSetupInterpreter(script);
+  const guard = interpreter === 'bash'
+    ? 'command -v bash >/dev/null 2>&1 || { echo "[setup:global] FAILED: bash not found" >&2; exit 127; }; '
+    : '';
+  const command = `${guard}printf %s ${shellQuote(encoded)} | base64 -d | ${interpreter}`;
 
-  const result = await runPodmanProcess(buildExecArgs({ name, env, command, user: 'root' }), 10 * 60 * 1000);
+  const timeoutMs = options.timeoutMs || config.setupTimeoutMs;
+  const result = await runPodmanProcess(buildExecArgs({ name, env, command, user: 'root' }), timeoutMs);
   const output = [
     result.stdout ? String(result.stdout).trim() : '',
     result.stderr ? String(result.stderr).trim() : '',
@@ -997,32 +1273,59 @@ async function runGlobalSetupScript(name) {
       'exec', name, '/bin/sh', '-c',
       `mkdir -p ${shellQuote(path.dirname(config.globalSetupMarkerPath))} && touch ${shellQuote(config.globalSetupMarkerPath)}`,
     ], { timeoutMs: 20000 });
-    return output ? `[setup:global] ${output}` : null;
+    return { ok: true, log: output ? `[setup:global] ${output}` : null, exitCode: 0 };
   }
 
-  return `[setup:global] FAILED (exit ${result.exitCode})\n${output}`;
+  return {
+    ok: false,
+    log: `[setup:global] FAILED (exit ${result.exitCode})\n${output}`.trim(),
+    exitCode: result.exitCode,
+  };
 }
 
 /**
  * Runs the repository setup script inside the container (once).
- * A failing setup script never breaks the container: the failure is logged and
- * the log is surfaced in the first `runCommand` result.
+ * A failing setup script never breaks the container: the failure is returned
+ * and recorded, and it is not retried on every command.
+ *
+ * @param {string} name - Container name.
+ * @param {string} worktreePath
+ * @param {{timeoutMs?: number, env?: Object}} [options]
+ * @returns {Promise<{ok: boolean, log: string|null, exitCode: number}>}
  */
-async function runSetupScript(name, worktreePath) {
+async function runSetupScript(name, worktreePath, options = {}) {
   const config = getSandboxConfig();
-  if (!worktreePath) return null;
+  if (!worktreePath) return { ok: true, log: null, exitCode: 0 };
 
   const scriptPath = path.join(worktreePath, config.setupScript);
-  if (!fs.existsSync(scriptPath)) return null;
+  if (!fs.existsSync(scriptPath)) return { ok: true, log: null, exitCode: 0 };
 
-  const env = buildContainerEnv({});
+  const env = options.env || buildContainerEnv({ worktreePath });
+  const interpreter = resolveSetupInterpreter(scriptPath);
+  const relativeScript = path.isAbsolute(config.setupScript)
+    ? config.setupScript
+    : `./${config.setupScript}`;
+
+  let invoke;
+  if (interpreter === 'direct') {
+    invoke = shellQuote(relativeScript);
+  } else if (interpreter === 'bash') {
+    invoke = [
+      'command -v bash >/dev/null 2>&1 || { echo "[setup] FAILED: bash not found" >&2; exit 127; }',
+      `bash ${shellQuote(relativeScript)}`,
+    ].join('; ');
+  } else {
+    invoke = `sh ${shellQuote(relativeScript)}`;
+  }
+
   const command = [
     'set -e',
     `cd ${shellQuote(worktreePath)}`,
-    `sh ${shellQuote(config.setupScript)}`,
+    invoke,
   ].join('; ');
 
-  const result = await runPodmanProcess(buildExecArgs({ name, env, command, user: 'root' }), 10 * 60 * 1000);
+  const timeoutMs = options.timeoutMs || config.setupTimeoutMs;
+  const result = await runPodmanProcess(buildExecArgs({ name, env, command, user: 'root' }), timeoutMs);
   const output = [
     result.stdout ? String(result.stdout).trim() : '',
     result.stderr ? String(result.stderr).trim() : '',
@@ -1034,10 +1337,14 @@ async function runSetupScript(name, worktreePath) {
       'exec', name, '/bin/sh', '-c',
       `mkdir -p ${shellQuote(path.dirname(config.setupMarkerPath))} && touch ${shellQuote(config.setupMarkerPath)}`,
     ], { timeoutMs: 20000 });
-    return output ? `[setup] ${output}` : null;
+    return { ok: true, log: output ? `[setup] ${output}` : null, exitCode: 0 };
   }
 
-  return `[setup] FAILED (exit ${result.exitCode})\n${output}`;
+  return {
+    ok: false,
+    log: `[setup] FAILED (exit ${result.exitCode})\n${output}`.trim(),
+    exitCode: result.exitCode,
+  };
 }
 
 /**
@@ -1065,7 +1372,15 @@ function isImageMissingError(stderr) {
  */
 function isContainerMissingError(stderr) {
   const text = String(stderr || '');
-  return /no such container|container .* not found|cannot find container/i.test(text);
+  return /no such container|no such object|container .* not found|cannot find container/i.test(text);
+}
+
+/**
+ * True when podman refuses to exec because the container is not running.
+ */
+function isContainerNotRunningError(stderr) {
+  const text = String(stderr || '');
+  return /can only create exec sessions on running containers|container state improper|container .* is not running/i.test(text);
 }
 
 // ── Command execution ──────────────────────────────────────────────────────
@@ -1160,6 +1475,9 @@ async function execInContainer(name, command, cwd, timeoutMs, env, timeoutBinary
   if (isContainerMissingError(String(result.stderr || ''))) {
     throw new Error(`Sandbox container ${name} is missing`);
   }
+  if (isContainerNotRunningError(String(result.stderr || ''))) {
+    throw new Error(`Sandbox container ${name} is not running`);
+  }
 
   // The `podman exec` stream intermittently closes before the inner command
   // finishes. When the stream is empty and the exit-code file is not written
@@ -1221,6 +1539,9 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
     exportPaths = [],
     configuredPaths = [],
     conversationId,
+    projectId = null,
+    image = null,
+    forceSetup = false,
     captureMode = 'file',
   } = sandboxOpts;
 
@@ -1244,7 +1565,7 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
   const ioTarget = config.ioMountTarget;
   const stackLimit = getSandboxStackLimit(config);
 
-  const { name, setupLog } = await ensureContainer({
+  const containerParams = {
     conversationId: containerId,
     repoRoot,
     worktreePath: resolvedWorktreePath,
@@ -1254,38 +1575,59 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
     configuredPaths,
     ioDir,
     ioTarget,
-  });
+    projectId,
+    image,
+    forceSetup,
+  };
 
-  const state = containerStates.get(String(containerId));
-  const env = state?.env || buildContainerEnv({ exportPaths, configuredPaths });
+  let ensured = await ensureContainer(containerParams);
 
   console.log('[podmanExecutor] Running command in sandbox', {
-    container: name,
+    container: ensured.name,
     cwd: resolvedCwd,
     command: String(command).slice(0, 100),
   });
 
-  const result = await execInContainer(
-    name,
-    command,
-    resolvedCwd,
-    timeoutMs,
-    env,
-    state?.timeoutBinary || null,
-    {
-      ioDir: state?.ioDir || ioDir,
-      ioTarget: state?.ioTarget || ioTarget,
-      captureMode,
-      stackLimit,
-    }
-  );
+  const execOnce = async () => {
+    const state = containerStates.get(String(containerId));
+    const env = state?.env || buildContainerEnv({ exportPaths, configuredPaths, worktreePath: resolvedWorktreePath });
+    return execInContainer(
+      ensured.name,
+      command,
+      resolvedCwd,
+      timeoutMs,
+      env,
+      state?.timeoutBinary || null,
+      {
+        ioDir: state?.ioDir || ioDir,
+        ioTarget: state?.ioTarget || ioTarget,
+        captureMode,
+        stackLimit,
+      }
+    );
+  };
 
+  let result;
+  try {
+    result = await execOnce();
+  } catch (err) {
+    const message = String(err?.message || err);
+    if (!/is missing|is not running/i.test(message)) throw err;
+    // Podman can lose the container between the create/start and the exec
+    // (a stale state after `rm -f` + `create` with the same name). Ensure it
+    // once more and retry, instead of failing the user's command.
+    console.warn(`[podmanExecutor] ${message} — recreating and retrying once`);
+    ensured = await ensureContainer(containerParams);
+    result = await execOnce();
+  }
+
+  const { name, setup } = ensured;
   lastActivity.set(name, Date.now());
 
-  // The setup log is surfaced in the first command result.
-  if (setupLog) {
-    result.stderr = [setupLog, result.stderr].filter(Boolean).join('\n');
-  }
+  // The setup status is a separate field: the full log belongs to the container
+  // state/UI, not to the stderr of every command (it used to flood the result
+  // and hide the real output).
+  if (setup) result.setup = setup;
 
   return result;
 }
@@ -1294,7 +1636,7 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
 
 /**
  * Lists the containers created by MiniBoss.
- * @returns {Array<{name: string, status: string, conversationId: string|null, worktree: string|null, createdAt: string|null}>}
+ * @returns {Array<{name: string, status: string, conversationId: string|null, worktree: string|null, createdAt: string|null, golden: boolean, projectId: string|null}>}
  */
 function listMiniBossContainers() {
   const config = getSandboxConfig();
@@ -1319,6 +1661,8 @@ function listMiniBossContainers() {
       createdAt: createdAt || null,
       conversationId: details.conversationId,
       worktree: details.worktree,
+      golden: details.golden,
+      projectId: details.projectId,
     });
   }
   return containers;
@@ -1330,14 +1674,24 @@ function listMiniBossContainers() {
 function inspectLabels(name) {
   const result = runPodmanSync([
     'inspect', name,
-    '--format', '{{index .Config.Labels "miniboss.conversation"}}|{{index .Config.Labels "miniboss.worktree"}}',
+    '--format',
+    [
+      '{{index .Config.Labels "miniboss.conversation"}}',
+      '{{index .Config.Labels "miniboss.worktree"}}',
+      '{{index .Config.Labels "miniboss.golden"}}',
+      '{{index .Config.Labels "miniboss.project"}}',
+    ].join('|'),
   ], { timeoutMs: 20000 });
 
-  if (result.exitCode !== 0) return { conversationId: null, worktree: null };
-  const [conversationId, worktree] = String(result.stdout || '').trim().split('|');
+  if (result.exitCode !== 0) {
+    return { conversationId: null, worktree: null, golden: false, projectId: null };
+  }
+  const [conversationId, worktree, golden, projectId] = String(result.stdout || '').trim().split('|');
   return {
     conversationId: conversationId && conversationId !== '' ? conversationId : null,
     worktree: worktree && worktree !== '' ? worktree : null,
+    golden: golden === 'true',
+    projectId: projectId && projectId !== '' ? projectId : null,
   };
 }
 
@@ -1403,6 +1757,9 @@ function removeOrphanContainers(conversationExists) {
   const removed = [];
 
   for (const container of listMiniBossContainers()) {
+    // The golden container of a project is never an orphan: it is owned by the
+    // project, not by a conversation, and the user manages it explicitly.
+    if (container.golden) continue;
     const conversationId = container.conversationId;
     const worktree = container.worktree;
 
@@ -1436,6 +1793,185 @@ function removeContainerForConversation(conversationId) {
   return result.exitCode === 0;
 }
 
+/**
+ * Name of the golden container of a project.
+ * @param {number|string} projectId
+ * @returns {string}
+ */
+function goldenContainerNameFor(projectId) {
+  const key = String(projectId == null ? '' : projectId).replace(/[^A-Za-z0-9_-]/g, '_');
+  return `miniboss-proj-${key || 'unknown'}`;
+}
+
+/**
+ * Ensures the golden container of a project exists and is running.
+ *
+ * The golden container is a per-project console the user enters from the host
+ * (`podman exec -it --user root <name> bash`) to install what the project needs. It mounts
+ * the repository read-write and the project cache, and is committed into the
+ * project image by `commitGoldenContainer`.
+ *
+ * @param {Object} params
+ * @param {number|string} params.projectId
+ * @param {string} params.repoRoot
+ * @param {string} [params.image]
+ * @returns {{name: string, created: boolean, started: boolean, running: boolean}}
+ */
+function ensureGoldenContainer(params = {}) {
+  const { projectId, repoRoot } = params;
+  if (!repoRoot) throw new Error('[podmanExecutor] The golden container requires the project folder');
+
+  const config = getSandboxConfig();
+  const image = resolveSandboxImage(params.image);
+  const cacheDir = getProjectSandboxCacheDir(projectId);
+  const name = goldenContainerNameFor(projectId);
+
+  const mounts = buildMountMap({ worktreePath: repoRoot, cacheDir });
+  const mountsKey = buildMountsKey(mounts);
+  const env = buildContainerEnv({ worktreePath: repoRoot });
+  const labels = {
+    [config.label]: config.labelValue,
+    'miniboss.golden': 'true',
+    'miniboss.project': String(projectId),
+    'miniboss.worktree': repoRoot,
+    'miniboss.mounts': mountsKey,
+    'miniboss.image': image,
+    'miniboss.spec': CONTAINER_SPEC_VERSION,
+  };
+
+  const info = inspectContainer(name);
+  let created = false;
+  let started = false;
+
+  const recreateReasons = [];
+  if (info) {
+    if (info.mountsKey !== mountsKey) recreateReasons.push('mount map changed');
+    if (info.image !== image) recreateReasons.push('image changed');
+    if (info.spec !== CONTAINER_SPEC_VERSION) recreateReasons.push('spec changed');
+  }
+
+  if (info && recreateReasons.length > 0) {
+    console.log(`[podmanExecutor] Recreating golden container ${name} (${recreateReasons.join(', ')})`);
+    runPodmanSync(['rm', '-f', name], { timeoutMs: 30000 });
+  }
+
+  if (!info || recreateReasons.length > 0) {
+    const createArgs = buildCreateArgs({
+      name,
+      image,
+      mounts,
+      env,
+      labels,
+      workdir: repoRoot,
+      network: config.network,
+    });
+    const createdResult = runPodmanSync(createArgs, { timeoutMs: 10 * 60 * 1000 });
+    if (createdResult.exitCode !== 0) {
+      const stderr = String(createdResult.stderr || '').trim();
+      if (isImageMissingError(stderr)) {
+        pullImageSync(image);
+        const retry = runPodmanSync(createArgs, { timeoutMs: 10 * 60 * 1000 });
+        if (retry.exitCode !== 0) {
+          throw new Error(`Failed to create the golden container: ${String(retry.stderr || retry.stdout).trim()}`);
+        }
+      } else {
+        throw new Error(
+          `Failed to create the golden container: ${stderr || createdResult.stdout || `exit code ${createdResult.exitCode}`}`
+        );
+      }
+    }
+    created = true;
+  }
+
+  const state = inspectContainer(name);
+  if (state && !state.running) {
+    const startResult = runPodmanSync(['start', name], { timeoutMs: 60000 });
+    if (startResult.exitCode !== 0) {
+      throw new Error(`Failed to start the golden container: ${String(startResult.stderr || '').trim()}`);
+    }
+    started = true;
+  }
+
+  prepareContainer(name, env, null).catch((err) => {
+    console.warn(`[podmanExecutor] Could not prepare the golden container ${name}: ${err?.message || err}`);
+  });
+
+  lastActivity.set(name, Date.now());
+  return { name, created, started, running: true };
+}
+
+/**
+ * Pulls an image synchronously (used by the golden container helpers).
+ * @param {string} image
+ */
+function pullImageSync(image) {
+  console.log(`[podmanExecutor] Pulling sandbox image ${image}...`);
+  const result = runPodmanSync(['pull', image], { timeoutMs: 15 * 60 * 1000 });
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to pull sandbox image ${image}: ${String(result.stderr || '').trim()}`);
+  }
+}
+
+/**
+ * Status of the golden container of a project.
+ * @param {number|string} projectId
+ * @returns {{name: string, exists: boolean, running: boolean, status: string|null, image: string|null}}
+ */
+function getGoldenContainerStatus(projectId) {
+  const name = goldenContainerNameFor(projectId);
+  const info = inspectContainer(name);
+  return {
+    name,
+    exists: Boolean(info),
+    running: Boolean(info && info.running),
+    status: info ? info.status : null,
+    image: info ? info.image : null,
+  };
+}
+
+/**
+ * Commits the golden container into the project image.
+ *
+ * The container is stopped before the commit (a running container can be
+ * captured in an inconsistent state) and started again afterwards. Bind mounts
+ * (the repository and the cache) are not captured, which is intended.
+ *
+ * @param {number|string} projectId
+ * @returns {string} The image reference that was created.
+ */
+function commitGoldenContainer(projectId) {
+  const name = goldenContainerNameFor(projectId);
+  const info = inspectContainer(name);
+  if (!info) {
+    throw new Error(`The golden container ${name} does not exist`);
+  }
+
+  runPodmanSync(['stop', name], { timeoutMs: 120000 });
+  const ref = `localhost/miniboss/proj-${projectId}:${Date.now()}`;
+  const result = runPodmanSync(['commit', name, ref], { timeoutMs: 10 * 60 * 1000 });
+  if (result.exitCode !== 0) {
+    // Bring the console back even when the commit fails.
+    runPodmanSync(['start', name], { timeoutMs: 60000 });
+    throw new Error(`Failed to commit the golden container: ${String(result.stderr || '').trim()}`);
+  }
+  runPodmanSync(['start', name], { timeoutMs: 60000 });
+  lastActivity.set(name, Date.now());
+  return ref;
+}
+
+/**
+ * Removes the golden container so it is recreated from the base image.
+ * @param {number|string} projectId
+ * @param {Object} params - `repoRoot` and optional `image` of the project.
+ * @returns {{name: string, created: boolean, started: boolean, running: boolean}}
+ */
+function resetGoldenContainer(projectId, params = {}) {
+  const name = goldenContainerNameFor(projectId);
+  runPodmanSync(['rm', '-f', name], { timeoutMs: 60000 });
+  lastActivity.delete(name);
+  return ensureGoldenContainer({ projectId, ...params });
+}
+
 module.exports = {
   CONTAINER_SPEC_VERSION,
   CONTAINER_CAPABILITIES,
@@ -1449,6 +1985,11 @@ module.exports = {
   buildCaptureCommand,
   buildCaptureId,
   buildStackLimitedCommand,
+  resolveSetupInterpreter,
+  detectSetupInterpreter,
+  isSetupDone,
+  detectTimeoutBinary,
+  shouldRetrySetup,
   resolveCapturedResult,
   waitForCapture,
   getCaptureStats,
@@ -1460,12 +2001,19 @@ module.exports = {
   runPodmanCommand,
   ensureGlobalSetupScript,
   runGlobalSetupScript,
+  runSetupScript,
   listMiniBossContainers,
   stopIdleContainers,
   removeOrphanContainers,
   removeContainerForConversation,
   removeIoDir,
+  goldenContainerNameFor,
+  ensureGoldenContainer,
+  getGoldenContainerStatus,
+  commitGoldenContainer,
+  resetGoldenContainer,
   isImageMissingError,
   isContainerMissingError,
+  isContainerNotRunningError,
   hasNewuidmap,
 };
