@@ -446,6 +446,137 @@ class DatabaseAPI {
     return { ...row, tags: Array.isArray(tags) ? tags : null };
   }
 
+  // ===== CODE ANNOTATIONS =====
+
+  /**
+   * Creates a code annotation for a file/line range in a project.
+   * @param {Object} data - { project_id, file_path, line_start, line_end, note, tags? }
+   * @returns {Object} Created annotation.
+   */
+  createCodeAnnotation(data) {
+    const stmt = this.connection.prepare(`
+      INSERT INTO code_annotations (project_id, file_path, line_start, line_end, note, tags, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `);
+    const result = stmt.run(
+      data.project_id,
+      data.file_path,
+      data.line_start,
+      data.line_end,
+      data.note,
+      Array.isArray(data.tags) ? JSON.stringify(data.tags) : (data.tags || null)
+    );
+    return this.getCodeAnnotation(result.lastInsertRowid);
+  }
+
+  /**
+   * Fetches a code annotation by ID.
+   * @param {number} id
+   * @returns {Object|null}
+   */
+  getCodeAnnotation(id) {
+    const row = this.connection.prepare(`
+      SELECT id, project_id, file_path, line_start, line_end, note, tags, created_at, updated_at
+      FROM code_annotations WHERE id = ?
+    `).get(id) || null;
+    return row ? this._normalizeCodeAnnotation(row) : null;
+  }
+
+  /**
+   * Lists code annotations of a file, ordered by line_start.
+   * @param {number} projectId
+   * @param {string} filePath
+   * @returns {Array}
+   */
+  getCodeAnnotationsByFile(projectId, filePath) {
+    const rows = this.connection.prepare(`
+      SELECT id, project_id, file_path, line_start, line_end, note, tags, created_at, updated_at
+      FROM code_annotations
+      WHERE project_id = ? AND file_path = ?
+      ORDER BY line_start ASC, id ASC
+    `).all(projectId, filePath);
+    return rows.map(row => this._normalizeCodeAnnotation(row));
+  }
+
+  /**
+   * Updates a code annotation.
+   * @param {number} id
+   * @param {Object} data - { note?, tags?, line_start?, line_end? }
+   * @returns {Object|null}
+   */
+  updateCodeAnnotation(id, data) {
+    const updates = [];
+    const params = [];
+    if (data.note !== undefined) {
+      updates.push('note = ?');
+      params.push(data.note);
+    }
+    if (data.line_start !== undefined) {
+      updates.push('line_start = ?');
+      params.push(data.line_start);
+    }
+    if (data.line_end !== undefined) {
+      updates.push('line_end = ?');
+      params.push(data.line_end);
+    }
+    if (data.tags !== undefined) {
+      updates.push('tags = ?');
+      params.push(Array.isArray(data.tags) ? JSON.stringify(data.tags) : data.tags);
+    }
+    if (updates.length === 0) {
+      return this.getCodeAnnotation(id);
+    }
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    params.push(id);
+    const result = this.connection.prepare(`
+      UPDATE code_annotations SET ${updates.join(', ')} WHERE id = ?
+    `).run(...params);
+    return result.changes > 0 ? this.getCodeAnnotation(id) : null;
+  }
+
+  /**
+   * Deletes a code annotation.
+   * @param {number} id
+   * @returns {boolean} True if a row was deleted.
+   */
+  deleteCodeAnnotation(id) {
+    const result = this.connection.prepare('DELETE FROM code_annotations WHERE id = ?').run(id);
+    return result.changes > 0;
+  }
+
+  /**
+   * Searches code annotations by LIKE on note and tags.
+   * @param {number} projectId
+   * @param {string} q
+   * @param {number} [limit=50]
+   * @returns {Array}
+   */
+  searchCodeAnnotations(projectId, q, limit = 50) {
+    const term = String(q || '').trim();
+    if (!term) return [];
+    const maxLimit = Number(limit) > 0 ? Number(limit) : 50;
+    const rows = this.connection.prepare(`
+      SELECT id, project_id, file_path, line_start, line_end, note, tags, created_at, updated_at
+      FROM code_annotations
+      WHERE project_id = ? AND (note LIKE ? OR tags LIKE ?)
+      ORDER BY line_start ASC, id ASC
+      LIMIT ?
+    `).all(projectId, `%${term}%`, `%${term}%`, maxLimit);
+    return rows.map(row => this._normalizeCodeAnnotation(row));
+  }
+
+  _normalizeCodeAnnotation(row) {
+    let tags = row.tags;
+    if (typeof tags === 'string') {
+      try {
+        tags = JSON.parse(tags);
+      } catch (_) {
+        tags = null;
+      }
+    }
+    return { ...row, tags: Array.isArray(tags) ? tags : null };
+  }
+
   // ===== PLAN EXECUTIONS =====
 
   /**

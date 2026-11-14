@@ -599,4 +599,27 @@ if (!messagesColumns2.includes('status')) {
         ON conversations(project_id) WHERE conversation_type = 'project';
     `);
 
+    // =====================================================================
+    // CODE ANNOTATIONS (Fase 2)
+    // Read-only code navigation annotations: line range + note + tags per file.
+    // Distinct from project_notes (project memory). Overlapping ranges allowed.
+    // =====================================================================
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS code_annotations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        file_path TEXT NOT NULL,
+        line_start INTEGER NOT NULL CHECK(line_start >= 1),
+        line_end INTEGER NOT NULL CHECK(line_end >= line_start),
+        note TEXT NOT NULL,
+        tags TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_code_annotations_project
+        ON code_annotations(project_id, file_path, line_start);
+    `);
+
     module.exports = db;
