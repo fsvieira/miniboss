@@ -558,6 +558,12 @@ export default function ProjectPage({
               As conversas passam a ser criadas a partir dessa imagem; as existentes são recriadas
               no próximo comando.
             </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              O <code>PATH</code> é lido de um login shell ao guardar. Um <code>export PATH=…</code>
+              interativo não fica na imagem: escreva o PATH num ficheiro de perfil (por exemplo
+              <code>/etc/profile.d/deno.sh</code>) ou instale a ferramenta em <code>/usr/local/bin</code>
+              (evite <code>/root</code>, que as conversas não conseguem ler).
+            </Typography>
 
             {containerInfo ? (
               <Box sx={{ mb: 2 }}>

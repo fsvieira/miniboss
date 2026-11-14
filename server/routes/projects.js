@@ -260,7 +260,7 @@ function containerPayload(project, status) {
     status: status.status,
     currentImage: status.image,
     commands: {
-      enter: `podman exec -it --user root ${status.name} bash`,
+      enter: `podman exec -it --user root ${status.name} /bin/bash -l`,
     },
   };
 }
@@ -288,6 +288,7 @@ router.post('/:id/container/start', (req, res) => {
       projectId: project.id,
       repoRoot: project.folder_path,
       image: project.sandbox_image || undefined,
+      basePath: project.sandbox_path || undefined,
     });
     res.json(containerPayload(project, getGoldenContainerStatus(project.id)));
   } catch (err) {
@@ -301,8 +302,13 @@ router.post('/:id/container/save', (req, res) => {
   if (!project) return;
   try {
     const { commitGoldenContainer, getGoldenContainerStatus } = require('../services/sandbox/podmanExecutor');
-    const image = commitGoldenContainer(project.id);
-    const updated = db.updateProject(project.id, { sandbox_image: image });
+    const { ref, path } = commitGoldenContainer(project.id);
+    const updated = db.updateProject(project.id, {
+      sandbox_image: ref,
+      // A failed capture yields null: the conversations fall back to the
+      // default PATH, exactly as before this feature.
+      sandbox_path: path,
+    });
     res.json(containerPayload(updated || project, getGoldenContainerStatus(project.id)));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -320,7 +326,7 @@ router.post('/:id/container/reset', (req, res) => {
       repoRoot: project.folder_path,
       image: baseImage || undefined,
     });
-    const updated = db.updateProject(project.id, { sandbox_image: null });
+    const updated = db.updateProject(project.id, { sandbox_image: null, sandbox_path: null });
     res.json(containerPayload(updated || project, getGoldenContainerStatus(project.id)));
   } catch (err) {
     res.status(500).json({ error: err.message });

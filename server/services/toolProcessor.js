@@ -280,15 +280,18 @@ class ToolProcessor {
     const worktreePath = conv?.worktree_path;
 
     // A project may have its own image (the golden container committed by the
-    // user). The executor recreates the conversation container lazily when the
-    // resolved image differs from the label of the current container.
+    // user) and its own base PATH (captured from the golden login shell). The
+    // executor recreates the conversation container lazily when either differs
+    // from the labels of the current container.
     let projectImage = null;
+    let projectPath = null;
     if (conv?.project_id != null) {
       try {
         const project = this.db.getProject(conv.project_id);
         projectImage = project?.sandbox_image || null;
+        projectPath = project?.sandbox_path || null;
       } catch (err) {
-        console.warn('[ToolProcessor] Could not read the project sandbox image:', err?.message || err);
+        console.warn('[ToolProcessor] Could not read the project sandbox config:', err?.message || err);
       }
     }
 
@@ -304,6 +307,7 @@ class ToolProcessor {
       conversationId,
       projectId: conv?.project_id ?? null,
       image: projectImage || undefined,
+      basePath: projectPath || undefined,
       // Only used by the bwrap runtime; the podman runtime builds its own
       // allowlisted environment (no host env leakage).
       env: this._buildRunEnv()

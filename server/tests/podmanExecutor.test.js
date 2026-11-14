@@ -9,6 +9,7 @@ const {
   buildMountMap,
   buildMountsKey,
   buildContainerEnv,
+  buildPathKey,
   buildCreateArgs,
   buildExecArgs,
   buildCaptureCommand,
@@ -20,6 +21,8 @@ const {
   waitForCapture,
   getCaptureStats,
   containerNameFor,
+  containerRecreateReasons,
+  captureGoldenPath,
   isImageMissingError,
   isContainerMissingError,
 } = require('../services/sandbox/podmanExecutor');
@@ -258,6 +261,70 @@ async function runTests() {
     const exported = '/home/user/.nvm/bin';
     const env = buildContainerEnv({ exportPaths: [exported], configuredPaths: [exported] });
     assert.ok(env.PATH.split(':').includes(exported));
+  });
+
+  // ── Project PATH captured from the golden container ─────────────────────
+
+  check('the captured PATH is used as the base PATH', () => {
+    const env = buildContainerEnv({ basePath: '/opt/deno/bin:/usr/local/bin:/usr/bin' });
+    const parts = env.PATH.split(':');
+    assert.deepStrictEqual(parts.slice(0, 3), ['/opt/deno/bin', '/usr/local/bin', '/usr/bin']);
+    assert.ok(!parts.includes('/sbin'), 'the default PATH is not merged in');
+  });
+
+  check('the captured PATH keeps the configured filter and appends export and local bins', () => {
+    const configured = '/home/user/.deno/bin';
+    const exported = '/home/user/.nvm/bin';
+    const env = buildContainerEnv({
+      basePath: `${configured}:/usr/bin`,
+      exportPaths: [exported],
+      configuredPaths: [configured, exported],
+      worktreePath: '/test/worktree',
+    });
+    const parts = env.PATH.split(':');
+    assert.ok(!parts.includes(configured), 'a configured path that is not exported is removed');
+    assert.ok(parts.includes(exported), 'the exported path is appended');
+    assert.ok(parts.includes('/test/worktree/.miniboss/bin'), 'the local bins are appended');
+    assert.strictEqual(parts[parts.length - 1], '/test/worktree/node_modules/.bin');
+  });
+
+  check('a missing base PATH falls back to the default container PATH', () => {
+    const env = buildContainerEnv({ basePath: null });
+    assert.ok(env.PATH.split(':').includes('/usr/bin'));
+  });
+
+  check('the PATH key is stable and changes with the PATH', () => {
+    const a = buildPathKey('/usr/bin:/bin');
+    assert.strictEqual(a, buildPathKey('/usr/bin:/bin'));
+    assert.notStrictEqual(a, buildPathKey('/opt/deno/bin:/usr/bin:/bin'));
+    assert.ok(/^[0-9a-f]{16}$/.test(a), 'the key must be safe to store in a podman label');
+  });
+
+  check('a changed PATH is a container recreate reason', () => {
+    const info = { mountsKey: 'm', image: 'i', spec: '4', pathKey: 'old' };
+    const reasons = containerRecreateReasons(info, { mountsKey: 'm', image: 'i', spec: '4', pathKey: 'new' });
+    assert.deepStrictEqual(reasons, ['PATH changed']);
+    assert.deepStrictEqual(
+      containerRecreateReasons(info, { mountsKey: 'm', image: 'i', spec: '4', pathKey: 'old' }),
+      []
+    );
+  });
+
+  check('captureGoldenPath returns the login-shell PATH and ignores profile noise', () => {
+    let seenArgs = null;
+    const path_ = captureGoldenPath('miniboss-proj-1', (args) => {
+      seenArgs = args;
+      return { stdout: 'welcome to the profile\n/opt/deno/bin:/usr/local/bin:/usr/bin\n', stderr: '', exitCode: 0 };
+    });
+    assert.strictEqual(path_, '/opt/deno/bin:/usr/local/bin:/usr/bin');
+    assert.ok(seenArgs.includes('--user') && seenArgs.includes('root'), 'the login shell runs as root');
+    assert.ok(seenArgs.includes('bash -lc') || seenArgs.some(a => String(a).includes('bash -lc')), 'bash login shell is preferred');
+  });
+
+  check('captureGoldenPath returns null on failure or empty output', () => {
+    assert.strictEqual(captureGoldenPath('c', () => ({ stdout: '/usr/bin', stderr: 'boom', exitCode: 1 })), null);
+    assert.strictEqual(captureGoldenPath('c', () => ({ stdout: '', stderr: '', exitCode: 0 })), null);
+    assert.strictEqual(captureGoldenPath('c', () => ({ stdout: 'not-a-path', stderr: '', exitCode: 0 })), null);
   });
 
   // ── podman create ───────────────────────────────────────────────────────

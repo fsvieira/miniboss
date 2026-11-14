@@ -36,7 +36,7 @@ class DatabaseAPI {
    */
   getProject(id) {
     const stmt = this.connection.prepare(`
-      SELECT id, name, folder_path, sandbox_image, created_at, updated_at
+      SELECT id, name, folder_path, sandbox_image, sandbox_path, created_at, updated_at
       FROM projects
       WHERE id = ?
     `);
@@ -50,7 +50,7 @@ class DatabaseAPI {
    */
   getAllProjects() {
     const stmt = this.connection.prepare(`
-      SELECT p.id, p.name, p.folder_path, p.sandbox_image, p.created_at, p.updated_at, COUNT(c.id) AS conversation_count
+      SELECT p.id, p.name, p.folder_path, p.sandbox_image, p.sandbox_path, p.created_at, p.updated_at, COUNT(c.id) AS conversation_count
       FROM projects p
       LEFT JOIN conversations c ON c.project_id = p.id
       GROUP BY p.id
@@ -89,6 +89,11 @@ class DatabaseAPI {
     if (data.sandbox_image !== undefined) {
       updates.push('sandbox_image = ?');
       params.push(data.sandbox_image);
+    }
+
+    if (data.sandbox_path !== undefined) {
+      updates.push('sandbox_path = ?');
+      params.push(data.sandbox_path);
     }
 
     if (updates.length === 0) {

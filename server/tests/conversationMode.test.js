@@ -13,6 +13,7 @@ async function testConversationModeDefaultsAndPersists() {
         name TEXT NOT NULL,
         folder_path TEXT,
         sandbox_image TEXT,
+        sandbox_path TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );

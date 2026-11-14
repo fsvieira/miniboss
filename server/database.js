@@ -36,6 +36,7 @@ db.exec(`
      name TEXT NOT NULL,
      folder_path TEXT,
      sandbox_image TEXT,
+     sandbox_path TEXT,
      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
    );
@@ -211,6 +212,12 @@ if (!projectsColumns.includes('folder_path')) {
 // Migration for projects table: add sandbox_image column (golden container image)
 if (!projectsColumns.includes('sandbox_image')) {
   db.prepare("ALTER TABLE projects ADD COLUMN sandbox_image TEXT").run();
+}
+
+// Migration for projects table: add sandbox_path column (PATH captured from the
+// golden container login shell and used as the base PATH of the conversations)
+if (!projectsColumns.includes('sandbox_path')) {
+  db.prepare("ALTER TABLE projects ADD COLUMN sandbox_path TEXT").run();
 }
 
 // Migration for conversations table: add last_summarized_at column

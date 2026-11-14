@@ -184,24 +184,41 @@ function buildMountsKey(mounts) {
 }
 
 /**
+ * Stable key of a PATH string — used to detect a container whose PATH is
+ * outdated (the PATH is fixed at `create` time through `-e PATH=…`).
+ * It is a digest so it can be stored safely in a podman label.
+ *
+ * @param {string} containerPath
+ * @returns {string}
+ */
+function buildPathKey(containerPath) {
+  return crypto.createHash('sha1').update(String(containerPath || '')).digest('hex').slice(0, 16);
+}
+
+/**
  * Builds the environment allowlist passed to the container (decision D7).
  *
  * @param {Object} params
  * @param {Array<string>} [params.exportPaths] - Sandbox paths exported to PATH.
  * @param {Array<string>} [params.configuredPaths] - Every configured sandbox path.
  * @param {string} [params.worktreePath] - Worktree whose local bins are added to PATH.
+ * @param {string} [params.basePath] - PATH captured from the project golden
+ *   container. When absent, the configured default PATH is used.
  * @returns {Object}
  */
 function buildContainerEnv(params = {}) {
   const config = getSandboxConfig();
   const exportPaths = (params.exportPaths || []).filter(Boolean);
   const configured = new Set((params.configuredPaths || []).filter(Boolean).map(p => path.resolve(p)));
+  const basePath = String(params.basePath || '').trim() || config.containerPath;
 
-  const imagePath = config.containerPath
-    .split(':')
-    .filter(Boolean)
+  const imagePath = [];
+  for (const entry of basePath.split(':')) {
+    if (!entry) continue;
     // A configured path that is NOT exported is removed from PATH.
-    .filter(p => !configured.has(path.resolve(p)) || exportPaths.includes(p));
+    if (configured.has(path.resolve(entry)) && !exportPaths.includes(entry)) continue;
+    if (!imagePath.includes(entry)) imagePath.push(entry);
+  }
 
   const merged = [...imagePath];
   for (const p of exportPaths) {
@@ -745,13 +762,13 @@ function containerNameFor(conversationId) {
 /**
  * Inspects a container.
  * @param {string} name
- * @returns {{exists: boolean, running: boolean, status: string, labels: Object, mountsKey: string|null, image: string|null, spec: string|null}|null}
+ * @returns {{exists: boolean, running: boolean, status: string, labels: Object, mountsKey: string|null, image: string|null, spec: string|null, pathKey: string|null}|null}
  */
 function inspectContainer(name) {
   const inspectArgs = [
     'inspect', name,
     '--format',
-    '{{.State.Status}}|{{index .Config.Labels "miniboss.mounts"}}|{{index .Config.Labels "miniboss.image"}}|{{index .Config.Labels "miniboss.spec"}}',
+    '{{.State.Status}}|{{index .Config.Labels "miniboss.mounts"}}|{{index .Config.Labels "miniboss.image"}}|{{index .Config.Labels "miniboss.spec"}}|{{index .Config.Labels "miniboss.path"}}',
   ];
 
   let result = runPodmanSync(inspectArgs, { timeoutMs: 20000 });
@@ -768,7 +785,7 @@ function inspectContainer(name) {
 
   if (result.exitCode !== 0) return null;
 
-  const [status, mountsKey, image, spec] = String(result.stdout || '').trim().split('|');
+  const [status, mountsKey, image, spec, pathKey] = String(result.stdout || '').trim().split('|');
   return {
     exists: true,
     running: status === 'running',
@@ -776,7 +793,26 @@ function inspectContainer(name) {
     mountsKey: mountsKey && mountsKey !== '' ? mountsKey : null,
     image: image && image !== '' ? image : null,
     spec: spec && spec !== '' ? spec : null,
+    pathKey: pathKey && pathKey !== '' ? pathKey : null,
   };
+}
+
+/**
+ * Reasons why an existing container must be recreated: the mounts, the image,
+ * the container specification and the PATH are fixed at `create` time.
+ *
+ * @param {Object|null} info - Result of `inspectContainer`.
+ * @param {{mountsKey: string, image: string, spec: string, pathKey: string}} expected
+ * @returns {Array<string>}
+ */
+function containerRecreateReasons(info, expected = {}) {
+  const reasons = [];
+  if (!info) return reasons;
+  if (info.mountsKey !== expected.mountsKey) reasons.push('mount map changed');
+  if (info.image !== expected.image) reasons.push('image changed');
+  if (info.spec !== expected.spec) reasons.push('spec changed');
+  if (info.pathKey !== expected.pathKey) reasons.push('PATH changed');
+  return reasons;
 }
 
 /**
@@ -796,6 +832,7 @@ function inspectContainer(name) {
  * @param {string} [params.ioTarget] - Mount point of the exchange inside the container.
  * @param {number|string} [params.projectId] - Project of the conversation (cache + image).
  * @param {string} [params.image] - Resolved image (defaults to the global one).
+ * @param {string} [params.basePath] - PATH captured from the project golden container.
  * @param {string} [params.cacheDir] - Host directory of the persistent cache.
  * @param {boolean} [params.forceSetup] - Run the setup even if it failed recently.
  * @returns {Promise<{name: string, created: boolean, started: boolean, setupLog: string|null, setup: Object}>}
@@ -813,6 +850,7 @@ async function ensureContainer(params = {}) {
     ioDir = null,
     ioTarget = config.ioMountTarget,
     projectId = null,
+    basePath = null,
     forceSetup = false,
   } = params;
 
@@ -835,7 +873,9 @@ async function ensureContainer(params = {}) {
     exportPaths,
     configuredPaths,
     worktreePath: worktreePath || repoRoot,
+    basePath,
   });
+  const pathKey = buildPathKey(env.PATH);
   const labels = {
     [config.label]: config.labelValue,
     'miniboss.conversation': String(conversationId),
@@ -843,18 +883,19 @@ async function ensureContainer(params = {}) {
     'miniboss.mounts': mountsKey,
     'miniboss.image': image,
     'miniboss.spec': CONTAINER_SPEC_VERSION,
+    'miniboss.path': pathKey,
   };
 
   const info = inspectContainer(name);
   let created = false;
   let started = false;
 
-  const recreateReasons = [];
-  if (info) {
-    if (info.mountsKey !== mountsKey) recreateReasons.push('mount map changed');
-    if (info.image !== image) recreateReasons.push('image changed');
-    if (info.spec !== CONTAINER_SPEC_VERSION) recreateReasons.push('spec changed');
-  }
+  const recreateReasons = containerRecreateReasons(info, {
+    mountsKey,
+    image,
+    spec: CONTAINER_SPEC_VERSION,
+    pathKey,
+  });
 
   if (info && recreateReasons.length > 0) {
     // These properties are fixed at create time — the container must be recreated.
@@ -1541,6 +1582,7 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
     conversationId,
     projectId = null,
     image = null,
+    basePath = null,
     forceSetup = false,
     captureMode = 'file',
   } = sandboxOpts;
@@ -1577,6 +1619,7 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
     ioTarget,
     projectId,
     image,
+    basePath,
     forceSetup,
   };
 
@@ -1590,7 +1633,7 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
 
   const execOnce = async () => {
     const state = containerStates.get(String(containerId));
-    const env = state?.env || buildContainerEnv({ exportPaths, configuredPaths, worktreePath: resolvedWorktreePath });
+    const env = state?.env || buildContainerEnv({ exportPaths, configuredPaths, worktreePath: resolvedWorktreePath, basePath });
     return execInContainer(
       ensured.name,
       command,
@@ -1815,6 +1858,7 @@ function goldenContainerNameFor(projectId) {
  * @param {number|string} params.projectId
  * @param {string} params.repoRoot
  * @param {string} [params.image]
+ * @param {string} [params.basePath] - PATH captured from a previous commit.
  * @returns {{name: string, created: boolean, started: boolean, running: boolean}}
  */
 function ensureGoldenContainer(params = {}) {
@@ -1828,7 +1872,8 @@ function ensureGoldenContainer(params = {}) {
 
   const mounts = buildMountMap({ worktreePath: repoRoot, cacheDir });
   const mountsKey = buildMountsKey(mounts);
-  const env = buildContainerEnv({ worktreePath: repoRoot });
+  const env = buildContainerEnv({ worktreePath: repoRoot, basePath: params.basePath });
+  const pathKey = buildPathKey(env.PATH);
   const labels = {
     [config.label]: config.labelValue,
     'miniboss.golden': 'true',
@@ -1837,18 +1882,19 @@ function ensureGoldenContainer(params = {}) {
     'miniboss.mounts': mountsKey,
     'miniboss.image': image,
     'miniboss.spec': CONTAINER_SPEC_VERSION,
+    'miniboss.path': pathKey,
   };
 
   const info = inspectContainer(name);
   let created = false;
   let started = false;
 
-  const recreateReasons = [];
-  if (info) {
-    if (info.mountsKey !== mountsKey) recreateReasons.push('mount map changed');
-    if (info.image !== image) recreateReasons.push('image changed');
-    if (info.spec !== CONTAINER_SPEC_VERSION) recreateReasons.push('spec changed');
-  }
+  const recreateReasons = containerRecreateReasons(info, {
+    mountsKey,
+    image,
+    spec: CONTAINER_SPEC_VERSION,
+    pathKey,
+  });
 
   if (info && recreateReasons.length > 0) {
     console.log(`[podmanExecutor] Recreating golden container ${name} (${recreateReasons.join(', ')})`);
@@ -1930,6 +1976,41 @@ function getGoldenContainerStatus(projectId) {
 }
 
 /**
+ * Reads the PATH a login shell sees inside a running container.
+ *
+ * `podman commit` does not persist an interactive `export PATH=…`; only what a
+ * profile file defines survives. Capturing the login-shell PATH at commit time
+ * gives the conversations the same base PATH as the golden console.
+ *
+ * A login shell is used (`bash -lc`, falling back to `sh -lc` because Debian's
+ * `sh` is dash and does not read `/etc/profile.d`). Profile output may pollute
+ * stdout, so only the last non-empty line is taken and it must look like a PATH.
+ *
+ * @param {string} name - Container name (must be running).
+ * @param {Function} [runner] - Injection point for tests (defaults to runPodmanSync).
+ * @returns {string|null} The captured PATH, or null on any failure.
+ */
+function captureGoldenPath(name, runner = runPodmanSync) {
+  if (!name) return null;
+  const command = 'if command -v bash >/dev/null 2>&1; then exec bash -lc \'printf "%s\\n" "$PATH"\'; fi; exec sh -lc \'printf "%s\\n" "$PATH"\'';
+  const result = runner(
+    ['exec', '--user', 'root', name, '/bin/sh', '-c', command],
+    { timeoutMs: 30000 }
+  );
+
+  // Exit code, never stdout, decides success.
+  if (!result || result.exitCode !== 0) return null;
+
+  const lines = String(result.stdout || '')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+  const captured = lines.length > 0 ? lines[lines.length - 1] : '';
+  if (!captured || !captured.includes('/')) return null;
+  return captured;
+}
+
+/**
  * Commits the golden container into the project image.
  *
  * The container is stopped before the commit (a running container can be
@@ -1937,7 +2018,8 @@ function getGoldenContainerStatus(projectId) {
  * (the repository and the cache) are not captured, which is intended.
  *
  * @param {number|string} projectId
- * @returns {string} The image reference that was created.
+ * @returns {{ref: string, path: string|null}} The image reference that was
+ *   created and the PATH captured from the login shell (null when unavailable).
  */
 function commitGoldenContainer(projectId) {
   const name = goldenContainerNameFor(projectId);
@@ -1945,6 +2027,9 @@ function commitGoldenContainer(projectId) {
   if (!info) {
     throw new Error(`The golden container ${name} does not exist`);
   }
+
+  // Capture before the stop: `podman exec` does not work on a stopped container.
+  const path = info.running ? captureGoldenPath(name) : null;
 
   runPodmanSync(['stop', name], { timeoutMs: 120000 });
   const ref = `localhost/miniboss/proj-${projectId}:${Date.now()}`;
@@ -1956,7 +2041,7 @@ function commitGoldenContainer(projectId) {
   }
   runPodmanSync(['start', name], { timeoutMs: 60000 });
   lastActivity.set(name, Date.now());
-  return ref;
+  return { ref, path };
 }
 
 /**
@@ -1980,6 +2065,7 @@ module.exports = {
   buildMountMap,
   buildMountsKey,
   buildContainerEnv,
+  buildPathKey,
   buildCreateArgs,
   buildExecArgs,
   buildCaptureCommand,
@@ -1995,6 +2081,7 @@ module.exports = {
   getCaptureStats,
   containerNameFor,
   inspectContainer,
+  containerRecreateReasons,
   ensureContainer,
   prepareContainer,
   execInContainer,
@@ -2010,6 +2097,7 @@ module.exports = {
   goldenContainerNameFor,
   ensureGoldenContainer,
   getGoldenContainerStatus,
+  captureGoldenPath,
   commitGoldenContainer,
   resetGoldenContainer,
   isImageMissingError,
