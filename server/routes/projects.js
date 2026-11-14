@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { DatabaseAPI, DatabaseConnection } = require('../services/db');
 const gitService = require('../services/gitService');
+const codeNavigator = require('../services/codeNavigator');
 const { getMaxIterations } = require('../utils/maxIterations');
 
 // Database API instance
@@ -51,6 +52,9 @@ router.put('/:id', (req, res) => {
       if (folder_path !== undefined) {
         const normalizedFolderPath = folder_path ? await gitService.validateProjectRepository(folder_path) : null;
         data.folder_path = normalizedFolderPath;
+        // The code navigator caches tracked files per project; drop it when the
+        // folder changes so navigation follows the new repository.
+        codeNavigator.invalidateCache(req.params.id);
       }
 
       const project = db.updateProject(req.params.id, data);

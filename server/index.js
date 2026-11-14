@@ -47,6 +47,7 @@ app.use(express.json({ limit: '50mb' }));
 
 // Import route modules
 const projectsRoutes = require('./routes/projects');
+const codeRoutes = require('./routes/code');
 const conversationsRoutes = require('./routes/conversations');
 const messagesRoutes = require('./routes/messages');
 const providersRoutes = require('./routes/providers');
@@ -68,6 +69,9 @@ aiRoutes.setIO(io);
 conversationsRoutes.setIO(io);
 
 // Routes
+// The code navigator is mounted before projectsRoutes so the `:projectId` mount
+// param never conflicts with `projectsRoutes` `/:id` routes.
+app.use('/api/projects/:projectId/code', codeRoutes);
 app.use('/api/projects', projectsRoutes);
 app.use('/api/conversations', conversationsRoutes.router);
 app.use('/api', messagesRoutes.router);

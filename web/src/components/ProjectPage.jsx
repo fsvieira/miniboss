@@ -38,6 +38,7 @@ import {
   saveProjectContainer,
   resetProjectContainer,
 } from '../api/sandbox';
+import CodeNavigator from './CodeNavigator';
 
 function TabPanel({ value, index, children }) {
   if (value !== index) return null;
@@ -345,6 +346,7 @@ export default function ProjectPage({
           <Tab label="Conversations" />
           <Tab label="Extra Files" />
           <Tab label="Container" />
+          <Tab label="Code" />
         </Tabs>
       </Box>
 
@@ -742,6 +744,11 @@ deno -v`}
                 Repor
               </Button>
             </Box>
+          </TabPanel>
+
+          {/* ── TAB 4: Code (read-only code navigator) ── */}
+          <TabPanel value={tabValue} index={4}>
+            <CodeNavigator project={project} />
           </TabPanel>
         </Box>
 
