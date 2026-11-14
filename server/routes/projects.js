@@ -254,6 +254,7 @@ function containerPayload(project, status) {
   return {
     projectId: project.id,
     image: project.sandbox_image || null,
+    path: project.sandbox_path || null,
     name: status.name,
     exists: status.exists,
     running: status.running,

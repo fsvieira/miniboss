@@ -48,6 +48,43 @@ function TabPanel({ value, index, children }) {
   );
 }
 
+function CodeExample({ title, caption, children }) {
+  return (
+    <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
+      <Typography
+        variant="caption"
+        sx={{ display: 'block', px: 1.5, py: 0.75, bgcolor: 'action.selected', fontWeight: 600 }}
+      >
+        {title}
+      </Typography>
+      <Box
+        component="pre"
+        sx={{
+          m: 0,
+          p: 1.5,
+          bgcolor: 'grey.900',
+          color: 'grey.100',
+          fontFamily: 'monospace',
+          fontSize: '0.8rem',
+          lineHeight: 1.6,
+          overflowX: 'auto',
+        }}
+      >
+        {children}
+      </Box>
+      {caption ? (
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ display: 'block', px: 1.5, py: 0.75 }}
+        >
+          {caption}
+        </Typography>
+      ) : null}
+    </Box>
+  );
+}
+
 export default function ProjectPage({
   project,
   onClose,
@@ -558,11 +595,86 @@ export default function ProjectPage({
               As conversas passam a ser criadas a partir dessa imagem; as existentes são recriadas
               no próximo comando.
             </Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-              O <code>PATH</code> é lido de um login shell ao guardar. Um <code>export PATH=…</code>
-              interativo não fica na imagem: escreva o PATH num ficheiro de perfil (por exemplo
-              <code>/etc/profile.d/deno.sh</code>) ou instale a ferramenta em <code>/usr/local/bin</code>
-              (evite <code>/root</code>, que as conversas não conseguem ler).
+
+            <Alert severity="info" sx={{ mb: 2 }}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 0.5 }}>
+                Como o PATH chega às conversas
+              </Typography>
+              <Typography variant="body2">
+                Ao clicar em <strong>Guardar como imagem do projeto</strong>, o MiniBoss lê o{' '}
+                <code>PATH</code> de um <strong>login shell</strong> dentro do container dourado e
+                usa-o como base nas conversas. Só o que estiver em ficheiros de perfil é capturado:
+                um <code>export PATH=…</code> escrito à mão na consola não é guardado pelo{' '}
+                <code>podman commit</code>. Depois de alterar um perfil, basta voltar a guardar — não
+                é preciso reiniciar nada.
+              </Typography>
+            </Alert>
+
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 0.5 }}>
+                Não instales ferramentas em /root
+              </Typography>
+              <Typography variant="body2">
+                A consola dourada entra como <code>root</code>, por isso <code>$HOME</code> é{' '}
+                <code>/root</code> (permissões <code>700</code>). As conversas correm com o teu uid
+                de utilizador e <strong>não conseguem ler /root</strong>. Instala em{' '}
+                <code>/usr/local/bin</code> ou <code>/opt</code>, que são legíveis por todos.
+              </Typography>
+            </Alert>
+
+            <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 1 }}>
+              Exemplos
+            </Typography>
+
+            <Box
+              sx={{
+                display: 'grid',
+                gap: 2,
+                mb: 2,
+                gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' },
+              }}
+            >
+              <CodeExample
+                title="Opção A — instalar em /usr/local/bin (recomendado)"
+                caption="Já está no PATH por defeito: não precisas de profile nenhum."
+              >
+                {`cp /root/.deno/bin/deno /usr/local/bin/deno
+chmod 755 /usr/local/bin/deno
+/usr/local/bin/deno --version`}
+              </CodeExample>
+
+              <CodeExample
+                title="Opção B — adicionar um diretório ao PATH"
+                caption="O bash -l lê /etc/profile.d/*.sh. O ~/.bashrc NÃO é lido por um login shell."
+              >
+                {`echo 'export PATH="/opt/deno/bin:$PATH"' > /etc/profile.d/deno.sh
+chmod 644 /etc/profile.d/deno.sh
+chmod -R a+rX /opt/deno`}
+              </CodeExample>
+            </Box>
+
+            <CodeExample
+              title="Verificar antes de guardar (na consola dourada)"
+              caption="Se o comando abaixo encontrar a ferramenta, o PATH está pronto a capturar."
+            >
+              {`echo $PATH
+command -v deno
+deno --version`}
+            </CodeExample>
+
+            <CodeExample
+              title="Confirmar depois de guardar (numa conversa do projeto)"
+              caption="O container da conversa é recriado no próximo comando porque a label miniboss.path mudou."
+            >
+              {`echo $PATH
+command -v deno
+deno -v`}
+            </CodeExample>
+
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1, mb: 2 }}>
+              Nota: para o PATH ser capturado, a ferramenta tem de estar num diretório legível pelo
+              uid das conversas. Um diretório dentro de <code>/root</code> nunca funciona, mesmo que
+              apareça no <code>PATH</code>.
             </Typography>
 
             {containerInfo ? (
@@ -574,6 +686,28 @@ export default function ProjectPage({
                 <Typography variant="body2" sx={{ mb: 0.5 }}>
                   <strong>Imagem do projeto:</strong> {containerInfo.image || 'imagem base'}
                 </Typography>
+                <Typography variant="body2" sx={{ mb: 0.5 }}>
+                  <strong>PATH guardado:</strong>{' '}
+                  {containerInfo.path ? 'capturado do login shell' : 'por capturar (usa o PATH por defeito)'}
+                </Typography>
+                {containerInfo.path ? (
+                  <Box
+                    component="pre"
+                    sx={{
+                      m: 0,
+                      mt: 0.5,
+                      p: 1,
+                      bgcolor: 'action.hover',
+                      borderRadius: 1,
+                      fontFamily: 'monospace',
+                      fontSize: '0.75rem',
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-all',
+                    }}
+                  >
+                    {containerInfo.path}
+                  </Box>
+                ) : null}
                 <Typography variant="body2" component="pre" sx={{ mt: 1, p: 1, bgcolor: 'action.hover', borderRadius: 1, fontSize: '0.8rem' }}>
                   {containerInfo.commands?.enter}
                 </Typography>
