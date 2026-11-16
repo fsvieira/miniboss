@@ -454,8 +454,7 @@ async function sendToAI({
    // Estimate total tokens the AI provider will see:
    //   finalMessages + tools definitions + max_tokens
    const finalMessages = [
-     { role: 'system', content: systemPrompt },
-     lightStateMessage,
+     { role: 'system', content: `${systemPrompt}\n\n${lightStateMessage.content}` },
      ...normalizedHistory,
    ];
 
@@ -479,8 +478,7 @@ async function sendToAI({
         });
        const tighterHistory = normalizeMessagesForLLM(tighterFilter);
        const tighterMessages = [
-         { role: 'system', content: systemPrompt },
-         lightStateMessage,
+         { role: 'system', content: `${systemPrompt}\n\n${lightStateMessage.content}` },
          ...tighterHistory,
        ];
        const tighterTokens = countMessageTokens(stripMeta(tighterMessages)) + toolsTokens + outputTokens;
@@ -510,8 +508,7 @@ async function sendToAI({
          }),
        };
        finalMessagesToUse = [
-         { role: 'system', content: systemPrompt },
-         minimalLightStateMessage,
+         { role: 'system', content: `${systemPrompt}\n\n${minimalLightStateMessage.content}` },
          ...minimalHistory,
        ];
        const minimalTokens = countMessageTokens(stripMeta(finalMessagesToUse)) + toolsTokens + outputTokens;
@@ -619,7 +616,10 @@ async function sendToAI({
   const aiClient = new AiClient({
     apiKey: targetProvider.api_key || 'dummy',
     baseUrl: targetProvider.base_url,
-    timeout: 600000,
+    // Local engines can spend many minutes processing the prompt before the
+    // first token (and before the response headers are flushed). Keep a
+    // generous header timeout so slow models are not disconnected.
+    timeout: 1800000,
     maxRetries: 3,
   });
 

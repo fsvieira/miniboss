@@ -1,5 +1,28 @@
 const OpenAI = require('openai');
+const { Agent, fetch: undiciFetch } = require('undici');
 const { normalizePricingBlock } = require('./priceCatalog');
+const { mergeSystemMessages } = require('../../utils/messageFilter');
+
+/**
+ * Shared undici dispatcher used for every provider request.
+ *
+ * Node's global fetch (undici) aborts a request after 5 minutes without
+ * response headers, and after 5 minutes without body data once the body has
+ * started. Local engines (LM Studio, llama.cpp) send neither while they
+ * process a large prompt, so a slow model would be disconnected before its
+ * first token. Both undici timeouts are disabled here; the SDK's own `timeout`
+ * still bounds the wait for response headers.
+ */
+let sharedDispatcher = null;
+function getSharedDispatcher() {
+  if (!sharedDispatcher) {
+    sharedDispatcher = new Agent({
+      headersTimeout: 0,
+      bodyTimeout: 0,
+    });
+  }
+  return sharedDispatcher;
+}
 
 /**
  * Transport client for communication with AI providers (OpenAI-compatible).
@@ -35,6 +58,11 @@ class AiClient {
       baseURL: this.config.baseUrl,
       timeout: this.config.timeout,
       maxRetries: this.config.maxRetries || 3, // Delegar retries no SDK
+      // Use undici's fetch with its dispatcher so the body idle timeout can be
+      // disabled (see getSharedDispatcher). Both must come from the same
+      // undici package for the dispatcher to be compatible.
+      fetch: undiciFetch,
+      fetchOptions: { dispatcher: getSharedDispatcher() },
     });
   }
 
@@ -49,7 +77,7 @@ class AiClient {
     // Prepare parameters for the request
     const requestParams = {
       model: model || this.config.model,
-      messages,
+      messages: mergeSystemMessages(messages),
       max_tokens: maxTokens || 8192,
     };
 
@@ -86,7 +114,7 @@ class AiClient {
     // Prepare parameters for the request
     const requestParams = {
       model: model || this.config.model,
-      messages,
+      messages: mergeSystemMessages(messages),
       max_tokens: maxTokens || 8192,
       stream: true, // Habilitar streaming
       // Some providers only report usage when this is set. Kilo reports it in the

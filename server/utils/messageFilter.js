@@ -281,8 +281,44 @@ function normalizeMessagesForLLM(messages) {
   }).filter(Boolean);
 }
 
+/**
+ * Fuses every `system` message into a single leading one.
+ *
+ * Strict chat templates (notably Qwen2.5/Qwen3 on vLLM, llama.cpp and SGLang)
+ * raise `System message must be at the beginning.` whenever a `system` message
+ * is not the first one. This helper guarantees at most one `system` message, at
+ * index 0, for every provider. It is pure and idempotent: it always returns a
+ * new array and never mutates the input.
+ *
+ * @param {Array<Object>} messages
+ * @returns {Array<Object>}
+ */
+function mergeSystemMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+
+  const systemContents = [];
+  const rest = [];
+
+  for (const m of messages) {
+    if (!m) continue;
+    if (m.role === 'system') {
+      const content = m.content == null ? '' : String(m.content);
+      systemContents.push(content);
+    } else {
+      rest.push(m);
+    }
+  }
+
+  if (systemContents.length === 0) {
+    return messages.slice();
+  }
+
+  return [{ role: 'system', content: systemContents.join('\n\n') }, ...rest];
+}
+
 module.exports = {
   filterMessagesForLLM,
   normalizeMessagesForLLM,
   formatRunCommandToolContent,
+  mergeSystemMessages,
 };
