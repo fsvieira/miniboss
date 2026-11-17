@@ -103,10 +103,6 @@ class SocketService {
     this.socket.on('planUpdated', (data) => {
       this.emit('planUpdated', data);
     });
-
-    this.socket.on('taskTreeUpdated', (data) => {
-      this.emit('taskTreeUpdated', data);
-    });
   }
 
   disconnect() {

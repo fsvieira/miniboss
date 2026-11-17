@@ -21,8 +21,6 @@ const DEFAULT_IMAGE = 'docker.io/library/node:22-bookworm';
 const DEFAULT_IDLE_TTL_MIN = 10;
 const DEFAULT_CONTAINER_HOME = '/home/miniboss';
 const DEFAULT_CONTAINER_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
-const DEFAULT_SETUP_SCRIPT = '.miniboss/setup.sh';
-const SETUP_MARKER_PATH = '/var/lib/miniboss/setup.done';
 const GLOBAL_SETUP_MARKER_PATH = '/var/lib/miniboss/global-setup.done';
 const DEFAULT_IO_MOUNT_TARGET = '/var/lib/miniboss/io';
 const DEFAULT_SHM_SIZE = '1g';
@@ -69,8 +67,6 @@ function getSandboxConfig() {
     idleTtlMs: (Number.isFinite(idleTtlMin) && idleTtlMin > 0 ? idleTtlMin : DEFAULT_IDLE_TTL_MIN) * 60 * 1000,
     containerHome: (process.env.SANDBOX_CONTAINER_HOME || DEFAULT_CONTAINER_HOME).trim(),
     containerPath: (process.env.SANDBOX_CONTAINER_PATH || DEFAULT_CONTAINER_PATH).trim(),
-    setupScript: (process.env.SANDBOX_SETUP_SCRIPT || DEFAULT_SETUP_SCRIPT).trim(),
-    setupMarkerPath: SETUP_MARKER_PATH,
     // Global setup: the CLI tools the container is missing (jq, rg, sqlite3, ip…).
     // It runs once per container, as root, and is not fatal when it fails.
     globalSetupEnabled: !/^(0|false|no|off)$/i.test(String(process.env.SANDBOX_GLOBAL_SETUP || '').trim()),
@@ -89,8 +85,8 @@ function getSandboxConfig() {
     setupRetryMs:
       (Number.isFinite(setupRetryMin) && setupRetryMin > 0 ? setupRetryMin : DEFAULT_SETUP_RETRY_MIN) *
       60 * 1000,
-    // Persistent cache shared between the golden container and the conversation
-    // sandboxes of the same project (Deno/npm/Playwright downloads…).
+    // Persistent cache shared between the conversation sandboxes of the same
+    // project (Deno/npm/Playwright downloads…).
     cacheDir: (
       process.env.SANDBOX_CACHE_DIR ||
       path.join(getDataFolder(), 'sandbox', DEFAULT_CACHE_SUBDIR)
@@ -191,8 +187,8 @@ function getSandboxIoDir(conversationKey) {
 /**
  * Resolves the sandbox image for a project.
  *
- * A project may have its own image (the "golden container" committed by the
- * user); otherwise the global/default image is used.
+ * A project may have its own base image (saved from a Setup & Test
+ * conversation); otherwise the global/default image is used.
  *
  * @param {string|null|undefined} projectImage
  * @returns {string}
@@ -205,9 +201,9 @@ function resolveSandboxImage(projectImage) {
 /**
  * Persistent cache directory of a project (host side).
  *
- * The golden container and every conversation sandbox of the project mount the
- * same directory at `${containerHome}/.cache`, so downloads survive container
- * recreation. Conversations without a project use a shared `_default` cache.
+ * Every conversation sandbox of the project mounts the same directory at
+ * `${containerHome}/.cache`, so downloads survive container recreation.
+ * Conversations without a project use a shared `_default` cache.
  *
  * @param {number|string|null|undefined} projectId
  * @returns {string} The absolute path of the directory.
@@ -311,8 +307,6 @@ module.exports = {
   DEFAULT_IDLE_TTL_MIN,
   DEFAULT_CONTAINER_HOME,
   DEFAULT_CONTAINER_PATH,
-  DEFAULT_SETUP_SCRIPT,
-  SETUP_MARKER_PATH,
   GLOBAL_SETUP_MARKER_PATH,
   DEFAULT_IO_MOUNT_TARGET,
   DEFAULT_SHM_SIZE,

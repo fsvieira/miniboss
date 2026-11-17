@@ -440,6 +440,64 @@ router.delete('/:id', (req, res) => {
     });
 });
 
+/**
+ * Creates an execution conversation from a plan text.
+ *
+ * Shared by `/execute-plan` (the project memory plan) and `/execute-text`
+ * (a message becomes the plan). Ensures the worktree, stores the plan and
+ * starts the AI loop with the same kickoff message in both flows.
+ *
+ * @param {number} projectId
+ * @param {string} plan
+ * @param {string|null} titleHint
+ * @param {number|null} globalConversationId - Source conversation recorded in plan_executions.
+ * @returns {Promise<Object>} The created execution conversation.
+ */
+async function createPlanExecution(projectId, plan, titleHint = null, globalConversationId = null) {
+  const project = db.getProject(projectId);
+  if (!project || !project.folder_path) {
+    throw new Error('Project has no folder_path set');
+  }
+
+  await gitService.validateProjectRepository(project.folder_path);
+
+  const title = titleHint || deriveExecutionTitle(plan, project.name);
+  const execution = db.createConversation({
+    project_id: projectId,
+    title,
+    conversation_type: 'main',
+    max_iterations: getMaxIterations()
+  });
+
+  db.updateProjectTimestamp(projectId);
+
+  await gitService.ensureConversationWorktree(execution.id);
+  await gitService.copyExtraFilesToWorktree(execution.id);
+
+  db.updatePlan(execution.id, plan);
+  db.setConversationMode(execution.id, 'exec');
+
+  const sourceConversationId = globalConversationId
+    || (db.getProjectConversation(projectId) || {}).id
+    || execution.id;
+
+  db.createPlanExecution({
+    project_id: projectId,
+    global_conversation_id: sourceConversationId,
+    execution_conversation_id: execution.id,
+    plan,
+    status: 'executing',
+  });
+
+  serviceFactory.getConversationManager().handleUserMessage(
+    { content: 'Execute the current plan. Use getPlan to load it and start with the first task.' },
+    execution.id,
+    null
+  );
+
+  return execution;
+}
+
 // POST /:id/execute-plan — Executar o plano da conversa global do projeto
 router.post('/:id/execute-plan', (req, res) => {
   Promise.resolve()
@@ -456,48 +514,78 @@ router.post('/:id/execute-plan', (req, res) => {
         return res.status(400).json({ error: 'No plan to execute' });
       }
 
-      const project = db.getProject(conv.project_id);
-      if (!project || !project.folder_path) {
-        return res.status(400).json({ error: 'Project has no folder_path set' });
-      }
-
-      const repoRoot = await gitService.validateProjectRepository(project.folder_path);
-
-      const title = deriveExecutionTitle(plan, project.name);
-      const execution = db.createConversation({
-        project_id: conv.project_id,
-        title,
-        conversation_type: 'main',
-        max_iterations: getMaxIterations()
-      });
-
-      db.updateProjectTimestamp(conv.project_id);
-
-      await gitService.ensureConversationWorktree(execution.id);
-      await gitService.copyExtraFilesToWorktree(execution.id);
-
-      db.updatePlan(execution.id, plan);
-      db.setConversationMode(execution.id, 'exec');
-
-      db.createPlanExecution({
-        project_id: conv.project_id,
-        global_conversation_id: conv.id,
-        execution_conversation_id: execution.id,
-        plan,
-        status: 'executing',
-      });
-
-      serviceFactory.getConversationManager().handleUserMessage(
-        { content: 'Execute the current plan. Use getPlan to load it and start with the first task.' },
-        execution.id,
-        null
-      );
-
+      const execution = await createPlanExecution(conv.project_id, plan, null, conv.id);
       res.status(201).json({ executionConversationId: execution.id });
     })
     .catch((error) => {
       res.status(400).json({ error: error.message });
     });
+});
+
+// POST /:id/execute-text — Start an execution conversation whose plan is a message
+router.post('/:id/execute-text', (req, res) => {
+  Promise.resolve()
+    .then(async () => {
+      const conv = db.getConversation(req.params.id);
+      if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+      const text = String(req.body?.text || '').trim();
+      if (!text) return res.status(400).json({ error: 'text is required' });
+
+      const project = db.getProject(conv.project_id);
+      if (!project || !project.folder_path) {
+        return res.status(400).json({ error: 'Project has no folder_path set' });
+      }
+
+      const execution = await createPlanExecution(conv.project_id, text, null, conv.id);
+      res.status(201).json({ executionConversationId: execution.id });
+    })
+    .catch((error) => {
+      res.status(400).json({ error: error.message });
+    });
+});
+
+// POST /:id/save-base-image — Commit the setup container into the project base image
+router.post('/:id/save-base-image', (req, res) => {
+  const conv = db.getConversation(req.params.id);
+  if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+  if (conv.conversation_type !== 'setup') {
+    return res.status(400).json({ error: 'save-base-image is only available for Setup & Test conversations' });
+  }
+
+  const project = db.getProject(conv.project_id);
+  if (!project || !project.folder_path) {
+    return res.status(400).json({ error: 'Project has no folder_path set' });
+  }
+
+  try {
+    const { containerNameFor, commitContainerImage, removeContainerForConversation } = require('../services/sandbox/podmanExecutor');
+
+    const name = containerNameFor(conv.id);
+    const ref = `localhost/miniboss/proj-${project.id}:${Date.now()}`;
+    const { ref: imageRef, path } = commitContainerImage(name, ref);
+
+    const updated = db.updateProject(project.id, {
+      sandbox_image: imageRef,
+      // A failed capture yields null: the conversations fall back to the
+      // default PATH, exactly as before this feature.
+      sandbox_path: path,
+    });
+
+    // The project memory container must be recreated from the new base image.
+    const projectConversation = db.getProjectConversation(project.id);
+    if (projectConversation) {
+      removeContainerForConversation(projectConversation.id);
+    }
+
+    res.json({
+      projectId: project.id,
+      image: updated ? updated.sandbox_image : imageRef,
+      path: updated ? updated.sandbox_path : path,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Embeddings / Indexing routes ────────────────────────────────────────────

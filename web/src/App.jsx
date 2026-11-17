@@ -7,7 +7,7 @@ import ProjectModal from './components/ProjectModal';
 import ProjectPage from './components/ProjectPage';
 import SettingsPage from './components/SettingsPage';
 import { getProjects, createProject, deleteProject, updateProject } from './api/projects';
-import { getConversations, createConversation, deleteConversation, updateConversation, getConversation, getConversationGitState } from './api/conversations';
+import { getConversations, createConversation, deleteConversation, updateConversation, getConversation, getConversationGitState, executeText } from './api/conversations';
 import chatStore from './stores/chatStore';
 
 const App = observer(function App() {
@@ -75,10 +75,17 @@ const App = observer(function App() {
         const latest = await getConversation(conv.id);
         setSelectedConversation(latest);
         setProjects((prev) =>
-          prev.map((p) => ({
-            ...p,
-            conversations: (p.conversations || []).map((c) => (c.id === latest.id ? latest : c)),
-          }))
+          prev.map((p) => {
+            if (p.id !== latest.project_id) return p;
+            const conversations = p.conversations || [];
+            const exists = conversations.some((c) => c.id === latest.id);
+            return {
+              ...p,
+              conversations: exists
+                ? conversations.map((c) => (c.id === latest.id ? latest : c))
+                : [latest, ...conversations],
+            };
+          })
         );
       } catch (e) {
         console.error('Failed to reload conversation metadata on switch:', e);
@@ -282,6 +289,12 @@ const App = observer(function App() {
     }
   };
 
+  const handleExecuteText = async (conversationId, text) => {
+    const { executionConversationId } = await executeText(conversationId, text);
+    await handleConversationsChanged();
+    await handleSetSelectedConversation({ id: executionConversationId });
+  };
+
   const handleProjectSaved = async (name, folderPath) => {
     if (editingProject) {
       // editing
@@ -396,6 +409,7 @@ const App = observer(function App() {
               onToggleSidebar={handleToggleSidebar}
               onOpenConversation={handleSetSelectedConversation}
               onConversationsChanged={handleConversationsChanged}
+              onExecuteText={handleExecuteText}
             />
           )}
         </Box>

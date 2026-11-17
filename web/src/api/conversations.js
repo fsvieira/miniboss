@@ -105,12 +105,6 @@ export async function getSubConversations(conversationId) {
   return response.json();
 }
 
-export async function fetchTaskTree(conversationId) {
-  const response = await fetch(`${API_URL}/conversations/${conversationId}/tasks`);
-  if (!response.ok) throw new Error('Failed to fetch task tree');
-  return response.json();
-}
-
 export async function getPlan(conversationId) {
   const response = await fetch(`${API_URL}/conversations/${conversationId}/plan`);
   const data = await response.json();
@@ -146,5 +140,25 @@ export async function executePlan(conversationId) {
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || 'Failed to execute plan');
+  return data;
+}
+
+export async function executeText(conversationId, text) {
+  const response = await fetch(`${API_URL}/conversations/${conversationId}/execute-text`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Failed to start execution from the message');
+  return data;
+}
+
+export async function saveBaseImage(conversationId) {
+  const response = await fetch(`${API_URL}/conversations/${conversationId}/save-base-image`, {
+    method: 'POST'
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Failed to save the base image');
   return data;
 }

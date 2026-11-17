@@ -4,7 +4,6 @@ const { readFile, readFileChunk, readFileLines, writeFile, editFile, moveFile, d
 const { listDirectory, getFileTree, createDirectory } = require('./tools/directoryOperations');
 const { searchFiles, searchInFiles, grepInFile } = require('./tools/searchOperations');
 const { readMultipleFiles, getFileInfo } = require('./tools/utilityOperations');
-const { createTaskTreeTools } = require('./tools/taskTreeTools');
 const gitService = require('./services/gitService');
 const { semanticSearch } = require('./indexer');
 
@@ -146,14 +145,6 @@ async function executeTool(toolName, args, workingDir, context = {}, conversatio
         throw new Error(`${toolName} requires conversationId`);
 
       default:
-        if (conversationId && ['addTodo', 'updateTodo', 'removeTodo', 'getTaskTree'].includes(toolName)) {
-          const taskTools = createTaskTreeTools(conversationId);
-          const tool = taskTools[toolName];
-          if (tool) {
-            result = await tool.handler(args);
-            break;
-          }
-        }
         if (conversationId && ['saveNote', 'updateNote', 'listNotes', 'searchNotes', 'getNote', 'listProjectConversations', 'requestConversationReport'].includes(toolName)) {
           const { createProjectTools } = require('./tools/projectTools');
           const projectTools = createProjectTools(conversationId);

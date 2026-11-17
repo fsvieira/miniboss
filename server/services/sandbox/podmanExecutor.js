@@ -29,8 +29,8 @@ const {
  *     container, and the file tools — which bypass the container — see the
  *     edits instantly);
  *   - the repository root mounted read-only;
- *   - `--userns=keep-id` (mandatory: without it the files written inside the
- *     container become root-owned on the host and break git operations);
+ *   - `--userns=keep-id:uid=0,gid=0` (mandatory: the container root maps to the
+ *     host user, so files stay host-owned even though commands run as root);
  *   - an explicit env allowlist (no host env leakage).
  */
 
@@ -39,9 +39,10 @@ const {
 /**
  * Capabilities kept inside the container.
  *
- * `--cap-drop=ALL` alone is too strict: the container root (which `--userns=keep-id`
- * maps to the *host* user) would not be able to write to the worktree, because
- * DAC_OVERRIDE is exactly the capability that bypasses the file mode checks.
+ * `--cap-drop=ALL` alone is too strict: the container root (which
+ * `--userns=keep-id:uid=0,gid=0` maps to the *host* user) would not be able to
+ * write to the worktree, because DAC_OVERRIDE is exactly the capability that
+ * bypasses the file mode checks.
  *
  * This is the podman default set: no NET_ADMIN, no SYS_ADMIN, no SYS_PTRACE,
  * no SYS_MODULE — the container cannot change the network or the host.
@@ -70,7 +71,7 @@ const INIT_COMMAND = 'trap "kill -TERM 0" TERM INT; sleep infinity & wait';
  * It is part of the container identity: when it changes, the containers created
  * by an older version of MiniBoss are recreated instead of being reused.
  */
-const CONTAINER_SPEC_VERSION = '4';
+const CONTAINER_SPEC_VERSION = '5';
 
 /** @type {Map<string, Object>} conversationId -> container state */
 const containerStates = new Map();
@@ -137,8 +138,7 @@ function buildMountMap(params = {}) {
   }
 
   // Persistent cache (Deno/npm/Playwright downloads…): it lives on the host so
-  // it survives the container recreation. The golden container of the project
-  // mounts the same directory, so what it warms is reused by the sandboxes.
+  // it survives the container recreation.
   if (cacheDir) {
     const resolvedCache = path.resolve(cacheDir);
     if (fs.existsSync(resolvedCache)) {
@@ -202,8 +202,8 @@ function buildPathKey(containerPath) {
  * @param {Array<string>} [params.exportPaths] - Sandbox paths exported to PATH.
  * @param {Array<string>} [params.configuredPaths] - Every configured sandbox path.
  * @param {string} [params.worktreePath] - Worktree whose local bins are added to PATH.
- * @param {string} [params.basePath] - PATH captured from the project golden
- *   container. When absent, the configured default PATH is used.
+ * @param {string} [params.basePath] - PATH captured from the project base
+ *   image. When absent, the configured default PATH is used.
  * @returns {Object}
  */
 function buildContainerEnv(params = {}) {
@@ -225,9 +225,8 @@ function buildContainerEnv(params = {}) {
     if (p && !merged.includes(p)) merged.push(p);
   }
 
-  // Project-local binaries (the setup script often installs shims there) and
-  // the node_modules bins must be reachable by every command, not only by the
-  // setup process. A non-existent directory in PATH is harmless.
+  // Project-local binaries and the node_modules bins must be reachable by
+  // every command. A non-existent directory in PATH is harmless.
   if (params.worktreePath) {
     const localBins = [
       path.join(params.worktreePath, '.miniboss', 'bin'),
@@ -283,8 +282,10 @@ function buildCreateArgs(params = {}) {
     'create',
     '--name', name,
     // Without keep-id the files written inside the container become root-owned
-    // on the host and break git commit/merge in gitService.
-    '--userns=keep-id',
+    // on the host and break git commit/merge in gitService. Anchoring the
+    // container root to the host user (`:uid=0,gid=0`) keeps the worktree files
+    // host-owned even though commands execute as root inside the container.
+    '--userns=keep-id:uid=0,gid=0',
     '--cap-drop=ALL',
     '--cap-add', CONTAINER_CAPABILITIES.join(','),
     '--security-opt=no-new-privileges',
@@ -322,23 +323,24 @@ function buildCreateArgs(params = {}) {
 /**
  * Builds the `podman exec` argument vector.
  *
- * The command runs as the **host user** (its uid inside the container is the
- * same, thanks to `--userns=keep-id`), so it owns the worktree and can write to
- * it without needing any capability. The image's own USER (the node image uses
- * `node`) is deliberately not used: that uid maps to a subuid and the files
- * would end up owned by a stranger.
+ * The command runs as the **container root**. `--userns=keep-id:uid=0,gid=0`
+ * maps that root to the host user, so the files it writes stay owned by the host
+ * user while the assistant can still install packages (`apt-get`, `pip`) inside
+ * the isolated container. `--cap-drop=ALL`, `no-new-privileges` and the rootless
+ * isolation keep the host out of reach; the worktree is still mounted read-only
+ * in plan mode.
  *
  * @param {Object} params
  * @param {string} params.name - Container name.
  * @param {string} params.cwd
  * @param {Object} params.env
  * @param {string} params.command
- * @param {string} [params.user] - Container user (default: the host user uid).
+ * @param {string} [params.user] - Container user (default: 'root').
  * @returns {string[]}
  */
 function buildExecArgs(params = {}) {
   const { name, cwd, env = {}, command } = params;
-  const user = params.user != null ? params.user : String(os.userInfo().uid);
+  const user = params.user != null ? params.user : 'root';
 
   const args = ['exec'];
   if (user) args.push('--user', user);
@@ -832,7 +834,7 @@ function containerRecreateReasons(info, expected = {}) {
  * @param {string} [params.ioTarget] - Mount point of the exchange inside the container.
  * @param {number|string} [params.projectId] - Project of the conversation (cache + image).
  * @param {string} [params.image] - Resolved image (defaults to the global one).
- * @param {string} [params.basePath] - PATH captured from the project golden container.
+ * @param {string} [params.basePath] - PATH captured from the project base image.
  * @param {string} [params.cacheDir] - Host directory of the persistent cache.
  * @param {boolean} [params.forceSetup] - Run the setup even if it failed recently.
  * @returns {Promise<{name: string, created: boolean, started: boolean, setupLog: string|null, setup: Object}>}
@@ -969,33 +971,12 @@ async function ensureContainer(params = {}) {
     const logs = [];
     let failed = null;
     let ran = false;
-    let repoSkippedReadOnly = false;
 
     if (!prepared.globalSetupDone && config.globalSetupEnabled && fs.existsSync(config.globalSetupScript)) {
       ran = true;
       const global = await runGlobalSetupScript(name, { timeoutMs: config.setupTimeoutMs });
       if (global.log) logs.push(global.log);
       if (!global.ok) failed = global;
-    }
-
-    // The repository setup writes project shims (`.miniboss/bin/deno`,
-    // node_modules…) into the worktree. On a read-only worktree (project / plan
-    // conversations) those writes fail by design, so the script is skipped
-    // instead of failing: its tools must come from the project image, not from
-    // a setup that cannot write.
-    const repoSetupPath = path.join(worktreePath || repoRoot, config.setupScript);
-    if (!failed && !prepared.setupDone && fs.existsSync(repoSetupPath)) {
-      if (readOnlyWorktree) {
-        repoSkippedReadOnly = true;
-      } else {
-        ran = true;
-        const repo = await runSetupScript(name, worktreePath || repoRoot, {
-          timeoutMs: config.setupTimeoutMs,
-          env,
-        });
-        if (repo.log) logs.push(repo.log);
-        if (!repo.ok) failed = repo;
-      }
     }
 
     setupLog = logs.filter(Boolean).join('\n') || null;
@@ -1010,13 +991,7 @@ async function ensureContainer(params = {}) {
       setup = { status: 'ok', exitCode: 0, summary: null };
       setupFailedAt = null;
     } else {
-      setup = {
-        status: 'skipped',
-        exitCode: 0,
-        summary: repoSkippedReadOnly
-          ? '[setup skipped: read-only worktree — tools must be provided by the project image]'
-          : null,
-      };
+      setup = { status: 'skipped', exitCode: 0, summary: null };
       setupFailedAt = null;
     }
 
@@ -1051,16 +1026,18 @@ async function ensureContainer(params = {}) {
 /**
  * Gives the files created by the root setup back to the host user.
  *
- * `--userns=keep-id` maps the container root to a subuid, so a setup that runs
- * as root would leave the worktree shims and the persistent cache owned by a
- * stranger on the host (the user could no longer edit or delete them).
+ * `--userns=keep-id:uid=0,gid=0` maps the container root to the host user, so
+ * the files a root setup creates are already host-owned. This helper remains as
+ * a safety net for edge cases (e.g. a container created with a different
+ * mapping) so the worktree and the persistent cache stay editable.
  *
  * @param {string} name
  * @param {Object} env
  * @param {string} [worktreePath]
  */
 function repairSetupOwnership(name, env, worktreePath) {
-  const uid = String(os.userInfo().uid);
+  // With `--userns=keep-id:uid=0,gid=0` the container root is the host user.
+  const uid = '0';
   const targets = [path.posix.join(env.HOME, '.cache')];
   if (worktreePath) {
     targets.push(path.posix.join(worktreePath, '.miniboss'));
@@ -1128,11 +1105,9 @@ async function prepareContainer(name, env, ioTarget) {
   // (keep-id), so the HOME directory belongs to the user and not to root.
   await runPodmanProcess(buildExecArgs({ name, env, command: parts.join('; '), user: 'root' }), 30000);
   const timeoutBinary = detectTimeoutBinary(name, env);
-  const setupDone = isSetupDone(name, config.setupMarkerPath);
   const globalSetupDone = isSetupDone(name, config.globalSetupMarkerPath);
   return {
     timeoutBinary,
-    setupDone,
     globalSetupDone,
   };
 }
@@ -1188,8 +1163,7 @@ function isSetupDone(name, markerPath) {
  *   - `iproute2`— `ip`/`ss`, to diagnose ports and network.
  *
  * Anything project-specific (a database CLI, a linter, a language toolchain)
- * belongs in the repository setup script (`<worktree>/.miniboss/setup.sh`),
- * which runs right after this one.
+ * belongs in the project base image, built in a Setup & Test conversation.
  */
 const DEFAULT_GLOBAL_SETUP_SCRIPT = [
   '#!/bin/sh',
@@ -1242,27 +1216,6 @@ function ensureGlobalSetupScript() {
 function detectSetupInterpreter(content) {
   const firstLine = String(content || '').split('\n')[0] || '';
   return /\bbash\b/.test(firstLine) ? 'bash' : 'sh';
-}
-
-/**
- * Resolves how a setup script must be invoked.
- *
- * - `direct`: the script is executable — run it as `./script`, so the kernel
- *   honors its shebang (bash scripts with `set -o pipefail` work).
- * - `bash`/`sh`: the script is not executable — run it with the interpreter
- *   declared by its shebang (never force `sh` on a bash script).
- *
- * @param {string} scriptPath
- * @returns {'direct'|'bash'|'sh'}
- */
-function resolveSetupInterpreter(scriptPath) {
-  try {
-    const stat = fs.statSync(scriptPath);
-    if ((stat.mode & 0o111) !== 0) return 'direct';
-    return detectSetupInterpreter(fs.readFileSync(scriptPath, 'utf8'));
-  } catch (_) {
-    return 'sh';
-  }
 }
 
 /**
@@ -1320,70 +1273,6 @@ async function runGlobalSetupScript(name, options = {}) {
   return {
     ok: false,
     log: `[setup:global] FAILED (exit ${result.exitCode})\n${output}`.trim(),
-    exitCode: result.exitCode,
-  };
-}
-
-/**
- * Runs the repository setup script inside the container (once).
- * A failing setup script never breaks the container: the failure is returned
- * and recorded, and it is not retried on every command.
- *
- * @param {string} name - Container name.
- * @param {string} worktreePath
- * @param {{timeoutMs?: number, env?: Object}} [options]
- * @returns {Promise<{ok: boolean, log: string|null, exitCode: number}>}
- */
-async function runSetupScript(name, worktreePath, options = {}) {
-  const config = getSandboxConfig();
-  if (!worktreePath) return { ok: true, log: null, exitCode: 0 };
-
-  const scriptPath = path.join(worktreePath, config.setupScript);
-  if (!fs.existsSync(scriptPath)) return { ok: true, log: null, exitCode: 0 };
-
-  const env = options.env || buildContainerEnv({ worktreePath });
-  const interpreter = resolveSetupInterpreter(scriptPath);
-  const relativeScript = path.isAbsolute(config.setupScript)
-    ? config.setupScript
-    : `./${config.setupScript}`;
-
-  let invoke;
-  if (interpreter === 'direct') {
-    invoke = shellQuote(relativeScript);
-  } else if (interpreter === 'bash') {
-    invoke = [
-      'command -v bash >/dev/null 2>&1 || { echo "[setup] FAILED: bash not found" >&2; exit 127; }',
-      `bash ${shellQuote(relativeScript)}`,
-    ].join('; ');
-  } else {
-    invoke = `sh ${shellQuote(relativeScript)}`;
-  }
-
-  const command = [
-    'set -e',
-    `cd ${shellQuote(worktreePath)}`,
-    invoke,
-  ].join('; ');
-
-  const timeoutMs = options.timeoutMs || config.setupTimeoutMs;
-  const result = await runPodmanProcess(buildExecArgs({ name, env, command, user: 'root' }), timeoutMs);
-  const output = [
-    result.stdout ? String(result.stdout).trim() : '',
-    result.stderr ? String(result.stderr).trim() : '',
-  ].filter(Boolean).join('\n');
-
-  if (result.exitCode === 0) {
-    // Mark the setup as done so a restart does not run it again.
-    runPodmanSync([
-      'exec', name, '/bin/sh', '-c',
-      `mkdir -p ${shellQuote(path.dirname(config.setupMarkerPath))} && touch ${shellQuote(config.setupMarkerPath)}`,
-    ], { timeoutMs: 20000 });
-    return { ok: true, log: output ? `[setup] ${output}` : null, exitCode: 0 };
-  }
-
-  return {
-    ok: false,
-    log: `[setup] FAILED (exit ${result.exitCode})\n${output}`.trim(),
     exitCode: result.exitCode,
   };
 }
@@ -1679,7 +1568,7 @@ async function runPodmanCommand(command, cwd = '.', timeoutMs = 0, sandboxOpts =
 
 /**
  * Lists the containers created by MiniBoss.
- * @returns {Array<{name: string, status: string, conversationId: string|null, worktree: string|null, createdAt: string|null, golden: boolean, projectId: string|null}>}
+ * @returns {Array<{name: string, status: string, conversationId: string|null, worktree: string|null, createdAt: string|null}>}
  */
 function listMiniBossContainers() {
   const config = getSandboxConfig();
@@ -1704,8 +1593,6 @@ function listMiniBossContainers() {
       createdAt: createdAt || null,
       conversationId: details.conversationId,
       worktree: details.worktree,
-      golden: details.golden,
-      projectId: details.projectId,
     });
   }
   return containers;
@@ -1721,20 +1608,16 @@ function inspectLabels(name) {
     [
       '{{index .Config.Labels "miniboss.conversation"}}',
       '{{index .Config.Labels "miniboss.worktree"}}',
-      '{{index .Config.Labels "miniboss.golden"}}',
-      '{{index .Config.Labels "miniboss.project"}}',
     ].join('|'),
   ], { timeoutMs: 20000 });
 
   if (result.exitCode !== 0) {
-    return { conversationId: null, worktree: null, golden: false, projectId: null };
+    return { conversationId: null, worktree: null };
   }
-  const [conversationId, worktree, golden, projectId] = String(result.stdout || '').trim().split('|');
+  const [conversationId, worktree] = String(result.stdout || '').trim().split('|');
   return {
     conversationId: conversationId && conversationId !== '' ? conversationId : null,
     worktree: worktree && worktree !== '' ? worktree : null,
-    golden: golden === 'true',
-    projectId: projectId && projectId !== '' ? projectId : null,
   };
 }
 
@@ -1800,9 +1683,6 @@ function removeOrphanContainers(conversationExists) {
   const removed = [];
 
   for (const container of listMiniBossContainers()) {
-    // The golden container of a project is never an orphan: it is owned by the
-    // project, not by a conversation, and the user manages it explicitly.
-    if (container.golden) continue;
     const conversationId = container.conversationId;
     const worktree = container.worktree;
 
@@ -1837,150 +1717,11 @@ function removeContainerForConversation(conversationId) {
 }
 
 /**
- * Name of the golden container of a project.
- * @param {number|string} projectId
- * @returns {string}
- */
-function goldenContainerNameFor(projectId) {
-  const key = String(projectId == null ? '' : projectId).replace(/[^A-Za-z0-9_-]/g, '_');
-  return `miniboss-proj-${key || 'unknown'}`;
-}
-
-/**
- * Ensures the golden container of a project exists and is running.
- *
- * The golden container is a per-project console the user enters from the host
- * (`podman exec -it --user root <name> bash`) to install what the project needs. It mounts
- * the repository read-write and the project cache, and is committed into the
- * project image by `commitGoldenContainer`.
- *
- * @param {Object} params
- * @param {number|string} params.projectId
- * @param {string} params.repoRoot
- * @param {string} [params.image]
- * @param {string} [params.basePath] - PATH captured from a previous commit.
- * @returns {{name: string, created: boolean, started: boolean, running: boolean}}
- */
-function ensureGoldenContainer(params = {}) {
-  const { projectId, repoRoot } = params;
-  if (!repoRoot) throw new Error('[podmanExecutor] The golden container requires the project folder');
-
-  const config = getSandboxConfig();
-  const image = resolveSandboxImage(params.image);
-  const cacheDir = getProjectSandboxCacheDir(projectId);
-  const name = goldenContainerNameFor(projectId);
-
-  const mounts = buildMountMap({ worktreePath: repoRoot, cacheDir });
-  const mountsKey = buildMountsKey(mounts);
-  const env = buildContainerEnv({ worktreePath: repoRoot, basePath: params.basePath });
-  const pathKey = buildPathKey(env.PATH);
-  const labels = {
-    [config.label]: config.labelValue,
-    'miniboss.golden': 'true',
-    'miniboss.project': String(projectId),
-    'miniboss.worktree': repoRoot,
-    'miniboss.mounts': mountsKey,
-    'miniboss.image': image,
-    'miniboss.spec': CONTAINER_SPEC_VERSION,
-    'miniboss.path': pathKey,
-  };
-
-  const info = inspectContainer(name);
-  let created = false;
-  let started = false;
-
-  const recreateReasons = containerRecreateReasons(info, {
-    mountsKey,
-    image,
-    spec: CONTAINER_SPEC_VERSION,
-    pathKey,
-  });
-
-  if (info && recreateReasons.length > 0) {
-    console.log(`[podmanExecutor] Recreating golden container ${name} (${recreateReasons.join(', ')})`);
-    runPodmanSync(['rm', '-f', name], { timeoutMs: 30000 });
-  }
-
-  if (!info || recreateReasons.length > 0) {
-    const createArgs = buildCreateArgs({
-      name,
-      image,
-      mounts,
-      env,
-      labels,
-      workdir: repoRoot,
-      network: config.network,
-    });
-    const createdResult = runPodmanSync(createArgs, { timeoutMs: 10 * 60 * 1000 });
-    if (createdResult.exitCode !== 0) {
-      const stderr = String(createdResult.stderr || '').trim();
-      if (isImageMissingError(stderr)) {
-        pullImageSync(image);
-        const retry = runPodmanSync(createArgs, { timeoutMs: 10 * 60 * 1000 });
-        if (retry.exitCode !== 0) {
-          throw new Error(`Failed to create the golden container: ${String(retry.stderr || retry.stdout).trim()}`);
-        }
-      } else {
-        throw new Error(
-          `Failed to create the golden container: ${stderr || createdResult.stdout || `exit code ${createdResult.exitCode}`}`
-        );
-      }
-    }
-    created = true;
-  }
-
-  const state = inspectContainer(name);
-  if (state && !state.running) {
-    const startResult = runPodmanSync(['start', name], { timeoutMs: 60000 });
-    if (startResult.exitCode !== 0) {
-      throw new Error(`Failed to start the golden container: ${String(startResult.stderr || '').trim()}`);
-    }
-    started = true;
-  }
-
-  prepareContainer(name, env, null).catch((err) => {
-    console.warn(`[podmanExecutor] Could not prepare the golden container ${name}: ${err?.message || err}`);
-  });
-
-  lastActivity.set(name, Date.now());
-  return { name, created, started, running: true };
-}
-
-/**
- * Pulls an image synchronously (used by the golden container helpers).
- * @param {string} image
- */
-function pullImageSync(image) {
-  console.log(`[podmanExecutor] Pulling sandbox image ${image}...`);
-  const result = runPodmanSync(['pull', image], { timeoutMs: 15 * 60 * 1000 });
-  if (result.exitCode !== 0) {
-    throw new Error(`Failed to pull sandbox image ${image}: ${String(result.stderr || '').trim()}`);
-  }
-}
-
-/**
- * Status of the golden container of a project.
- * @param {number|string} projectId
- * @returns {{name: string, exists: boolean, running: boolean, status: string|null, image: string|null}}
- */
-function getGoldenContainerStatus(projectId) {
-  const name = goldenContainerNameFor(projectId);
-  const info = inspectContainer(name);
-  return {
-    name,
-    exists: Boolean(info),
-    running: Boolean(info && info.running),
-    status: info ? info.status : null,
-    image: info ? info.image : null,
-  };
-}
-
-/**
  * Reads the PATH a login shell sees inside a running container.
  *
  * `podman commit` does not persist an interactive `export PATH=…`; only what a
  * profile file defines survives. Capturing the login-shell PATH at commit time
- * gives the conversations the same base PATH as the golden console.
+ * gives the conversations the same base PATH as the container that was saved.
  *
  * A login shell is used (`bash -lc`, falling back to `sh -lc` because Debian's
  * `sh` is dash and does not read `/etc/profile.d`). Profile output may pollute
@@ -1990,7 +1731,7 @@ function getGoldenContainerStatus(projectId) {
  * @param {Function} [runner] - Injection point for tests (defaults to runPodmanSync).
  * @returns {string|null} The captured PATH, or null on any failure.
  */
-function captureGoldenPath(name, runner = runPodmanSync) {
+function captureContainerPath(name, runner = runPodmanSync) {
   if (!name) return null;
   const command = 'if command -v bash >/dev/null 2>&1; then exec bash -lc \'printf "%s\\n" "$PATH"\'; fi; exec sh -lc \'printf "%s\\n" "$PATH"\'';
   const result = runner(
@@ -2011,50 +1752,37 @@ function captureGoldenPath(name, runner = runPodmanSync) {
 }
 
 /**
- * Commits the golden container into the project image.
+ * Commits a container into a new image and restarts it.
  *
  * The container is stopped before the commit (a running container can be
  * captured in an inconsistent state) and started again afterwards. Bind mounts
- * (the repository and the cache) are not captured, which is intended.
+ * (the worktree, the repository and the cache) are not captured, which is
+ * intended: only the image layer (installed tools + profile scripts) is saved.
  *
- * @param {number|string} projectId
+ * @param {string} name - Container name (must exist).
+ * @param {string} ref - Image reference to create.
  * @returns {{ref: string, path: string|null}} The image reference that was
  *   created and the PATH captured from the login shell (null when unavailable).
  */
-function commitGoldenContainer(projectId) {
-  const name = goldenContainerNameFor(projectId);
+function commitContainerImage(name, ref) {
   const info = inspectContainer(name);
   if (!info) {
-    throw new Error(`The golden container ${name} does not exist`);
+    throw new Error(`The sandbox container ${name} does not exist`);
   }
 
   // Capture before the stop: `podman exec` does not work on a stopped container.
-  const path = info.running ? captureGoldenPath(name) : null;
+  const path = info.running ? captureContainerPath(name) : null;
 
   runPodmanSync(['stop', name], { timeoutMs: 120000 });
-  const ref = `localhost/miniboss/proj-${projectId}:${Date.now()}`;
   const result = runPodmanSync(['commit', name, ref], { timeoutMs: 10 * 60 * 1000 });
   if (result.exitCode !== 0) {
-    // Bring the console back even when the commit fails.
+    // Bring the container back even when the commit fails.
     runPodmanSync(['start', name], { timeoutMs: 60000 });
-    throw new Error(`Failed to commit the golden container: ${String(result.stderr || '').trim()}`);
+    throw new Error(`Failed to commit the sandbox container: ${String(result.stderr || '').trim()}`);
   }
   runPodmanSync(['start', name], { timeoutMs: 60000 });
   lastActivity.set(name, Date.now());
   return { ref, path };
-}
-
-/**
- * Removes the golden container so it is recreated from the base image.
- * @param {number|string} projectId
- * @param {Object} params - `repoRoot` and optional `image` of the project.
- * @returns {{name: string, created: boolean, started: boolean, running: boolean}}
- */
-function resetGoldenContainer(projectId, params = {}) {
-  const name = goldenContainerNameFor(projectId);
-  runPodmanSync(['rm', '-f', name], { timeoutMs: 60000 });
-  lastActivity.delete(name);
-  return ensureGoldenContainer({ projectId, ...params });
 }
 
 module.exports = {
@@ -2071,7 +1799,6 @@ module.exports = {
   buildCaptureCommand,
   buildCaptureId,
   buildStackLimitedCommand,
-  resolveSetupInterpreter,
   detectSetupInterpreter,
   isSetupDone,
   detectTimeoutBinary,
@@ -2088,18 +1815,13 @@ module.exports = {
   runPodmanCommand,
   ensureGlobalSetupScript,
   runGlobalSetupScript,
-  runSetupScript,
   listMiniBossContainers,
   stopIdleContainers,
   removeOrphanContainers,
   removeContainerForConversation,
   removeIoDir,
-  goldenContainerNameFor,
-  ensureGoldenContainer,
-  getGoldenContainerStatus,
-  captureGoldenPath,
-  commitGoldenContainer,
-  resetGoldenContainer,
+  captureContainerPath,
+  commitContainerImage,
   isImageMissingError,
   isContainerMissingError,
   isContainerNotRunningError,

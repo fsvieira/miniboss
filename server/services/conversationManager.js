@@ -607,7 +607,7 @@ class ConversationManager {
             return this._computeFocusNextState(conversation, event, message);
         }
 
-        if (conversation_type === 'main') {
+        if (conversation_type === 'main' || conversation_type === 'setup') {
             return this._computeMainNextState(conversation, event, message);
         }
 

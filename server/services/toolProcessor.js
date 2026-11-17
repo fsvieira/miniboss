@@ -4,7 +4,6 @@ const { MESSAGE_STATES, FINAL_MESSAGE_STATES, PROCESSING_STATES } = require('../
 const { executeTool } = require('../tools');
 const { runSandboxCommand } = require('./sandbox');
 const { safeSerializeToolResult } = require('../controllers/toolUtils');
-const { createTaskTreeTools } = require('../tools/taskTreeTools');
 const path = require('path');
 
 /**
@@ -145,21 +144,6 @@ class ToolProcessor {
       await this.conversationManager.handleToolResult(conversationId, toolMsg.id, result, null);
     }
 
-    if (
-      ['addTodo', 'updateTodo', 'removeTodo', 'getTaskTree'].includes(toolName) &&
-      conversationId
-    ) {
-      try {
-        const taskTree = await createTaskTreeTools(conversationId).getTaskTree.handler();
-        this.socketService.broadcastToConversation(conversationId, 'taskTreeUpdated', {
-          conversationId,
-          tree: taskTree
-        });
-      } catch (taskTreeError) {
-        console.error('[ToolProcessor] Failed to emit taskTreeUpdated:', taskTreeError);
-      }
-    }
-
     if (toolName === 'updatePlan' && conversationId) {
       try {
         const { createPlanTools } = require('../tools/planTools');
@@ -279,10 +263,10 @@ class ToolProcessor {
     const repoRoot = conv?.repo_root;
     const worktreePath = conv?.worktree_path;
 
-    // A project may have its own image (the golden container committed by the
-    // user) and its own base PATH (captured from the golden login shell). The
-    // executor recreates the conversation container lazily when either differs
-    // from the labels of the current container.
+    // A project may have its own base image (saved from a Setup & Test
+    // conversation) and its own base PATH (captured from the saved container's
+    // login shell). The executor recreates the conversation container lazily
+    // when either differs from the labels of the current container.
     let projectImage = null;
     let projectPath = null;
     if (conv?.project_id != null) {

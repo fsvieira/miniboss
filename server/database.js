@@ -209,13 +209,13 @@ if (!projectsColumns.includes('folder_path')) {
   db.prepare("ALTER TABLE projects ADD COLUMN folder_path TEXT").run();
 }
 
-// Migration for projects table: add sandbox_image column (golden container image)
+// Migration for projects table: add sandbox_image column (project base image)
 if (!projectsColumns.includes('sandbox_image')) {
   db.prepare("ALTER TABLE projects ADD COLUMN sandbox_image TEXT").run();
 }
 
 // Migration for projects table: add sandbox_path column (PATH captured from the
-// golden container login shell and used as the base PATH of the conversations)
+// saved base image login shell and used as the base PATH of the conversations)
 if (!projectsColumns.includes('sandbox_path')) {
   db.prepare("ALTER TABLE projects ADD COLUMN sandbox_path TEXT").run();
 }

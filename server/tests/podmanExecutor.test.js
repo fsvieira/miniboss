@@ -14,7 +14,6 @@ const {
   buildExecArgs,
   buildCaptureCommand,
   buildStackLimitedCommand,
-  resolveSetupInterpreter,
   detectSetupInterpreter,
   shouldRetrySetup,
   resolveCapturedResult,
@@ -22,7 +21,7 @@ const {
   getCaptureStats,
   containerNameFor,
   containerRecreateReasons,
-  captureGoldenPath,
+  captureContainerPath,
   isImageMissingError,
   isContainerMissingError,
 } = require('../services/sandbox/podmanExecutor');
@@ -188,25 +187,8 @@ async function runTests() {
   // ── Setup interpreter ───────────────────────────────────────────────────
 
   check('the setup interpreter follows the shebang', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniboss-setup-'));
-    try {
-      const bashScript = path.join(dir, 'bash.sh');
-      fs.writeFileSync(bashScript, '#!/usr/bin/env bash\nset -euo pipefail\n', { mode: 0o644 });
-      assert.strictEqual(resolveSetupInterpreter(bashScript), 'bash');
-
-      const shScript = path.join(dir, 'sh.sh');
-      fs.writeFileSync(shScript, '#!/bin/sh\nset -e\n', { mode: 0o644 });
-      assert.strictEqual(resolveSetupInterpreter(shScript), 'sh');
-
-      const executable = path.join(dir, 'exec.sh');
-      fs.writeFileSync(executable, '#!/usr/bin/env bash\necho hi\n', { mode: 0o755 });
-      assert.strictEqual(resolveSetupInterpreter(executable), 'direct');
-
-      assert.strictEqual(detectSetupInterpreter('#!/usr/bin/env bash\n'), 'bash');
-      assert.strictEqual(detectSetupInterpreter('#!/bin/sh\n'), 'sh');
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    assert.strictEqual(detectSetupInterpreter('#!/usr/bin/env bash\n'), 'bash');
+    assert.strictEqual(detectSetupInterpreter('#!/bin/sh\n'), 'sh');
   });
 
   check('a failed setup is retried only after the backoff or when forced', () => {
@@ -247,7 +229,7 @@ async function runTests() {
   check('the worktree local bins are added to PATH', () => {
     const env = buildContainerEnv({ worktreePath: '/test/worktree' });
     const parts = env.PATH.split(':');
-    assert.ok(parts.includes('/test/worktree/.miniboss/bin'), 'the setup shims must be reachable');
+    assert.ok(parts.includes('/test/worktree/.miniboss/bin'), 'the local bins must be reachable');
     assert.ok(parts.includes('/test/worktree/node_modules/.bin'), 'the node_modules bins must be reachable');
   });
 
@@ -263,7 +245,7 @@ async function runTests() {
     assert.ok(env.PATH.split(':').includes(exported));
   });
 
-  // ── Project PATH captured from the golden container ─────────────────────
+  // ── Project PATH captured from the saved base image ─────────────────────
 
   check('the captured PATH is used as the base PATH', () => {
     const env = buildContainerEnv({ basePath: '/opt/deno/bin:/usr/local/bin:/usr/bin' });
@@ -310,9 +292,9 @@ async function runTests() {
     );
   });
 
-  check('captureGoldenPath returns the login-shell PATH and ignores profile noise', () => {
+  check('captureContainerPath returns the login-shell PATH and ignores profile noise', () => {
     let seenArgs = null;
-    const path_ = captureGoldenPath('miniboss-proj-1', (args) => {
+    const path_ = captureContainerPath('miniboss-1', (args) => {
       seenArgs = args;
       return { stdout: 'welcome to the profile\n/opt/deno/bin:/usr/local/bin:/usr/bin\n', stderr: '', exitCode: 0 };
     });
@@ -321,10 +303,10 @@ async function runTests() {
     assert.ok(seenArgs.includes('bash -lc') || seenArgs.some(a => String(a).includes('bash -lc')), 'bash login shell is preferred');
   });
 
-  check('captureGoldenPath returns null on failure or empty output', () => {
-    assert.strictEqual(captureGoldenPath('c', () => ({ stdout: '/usr/bin', stderr: 'boom', exitCode: 1 })), null);
-    assert.strictEqual(captureGoldenPath('c', () => ({ stdout: '', stderr: '', exitCode: 0 })), null);
-    assert.strictEqual(captureGoldenPath('c', () => ({ stdout: 'not-a-path', stderr: '', exitCode: 0 })), null);
+  check('captureContainerPath returns null on failure or empty output', () => {
+    assert.strictEqual(captureContainerPath('c', () => ({ stdout: '/usr/bin', stderr: 'boom', exitCode: 1 })), null);
+    assert.strictEqual(captureContainerPath('c', () => ({ stdout: '', stderr: '', exitCode: 0 })), null);
+    assert.strictEqual(captureContainerPath('c', () => ({ stdout: 'not-a-path', stderr: '', exitCode: 0 })), null);
   });
 
   // ── podman create ───────────────────────────────────────────────────────
@@ -345,7 +327,7 @@ async function runTests() {
 
     assert.strictEqual(args[0], 'create');
     assert.strictEqual(argValue(args, '--name'), 'miniboss-42');
-    assert.ok(args.includes('--userns=keep-id'), 'keep-id is mandatory');
+    assert.ok(args.includes('--userns=keep-id:uid=0,gid=0'), 'keep-id must map the container root to the host user');
     assert.ok(args.includes('--cap-drop=ALL'));
     assert.ok(args.includes('--security-opt=no-new-privileges'));
     assert.ok(args.includes('miniboss=true'), 'the miniboss label must be set');
@@ -629,7 +611,7 @@ async function runTests() {
     });
 
     assert.strictEqual(args[0], 'exec');
-    assert.strictEqual(argValue(args, '--user'), String(os.userInfo().uid));
+    assert.strictEqual(argValue(args, '--user'), 'root');
     assert.strictEqual(argValue(args, '-w'), '/test/worktree');
     assert.ok(args.includes('HOME=/home/miniboss'));
     assert.ok(args.includes('CI=1'));
@@ -639,11 +621,11 @@ async function runTests() {
     assert.strictEqual(args[args.length - 1], 'echo hi');
   });
 
-  check('the command runs as the host user, not as the image USER', () => {
+  check('the command runs as container root, not as the image USER', () => {
     const args = buildExecArgs({ name: 'c', command: 'id' });
-    // The node image uses `node` (uid 1000) which maps to a subuid — the files
-    // would end up owned by a stranger.
-    assert.strictEqual(argValue(args, '--user'), String(os.userInfo().uid));
+    // `--userns=keep-id` maps this root to the host user, so installed packages
+    // are possible while written files stay host-owned.
+    assert.strictEqual(argValue(args, '--user'), 'root');
   });
 
   check('the container keeps a usable capability set', () => {

@@ -30,3 +30,16 @@ export async function deleteProject(id) {
   const response = await fetch(`${API_URL}/projects/${id}`, { method: 'DELETE' });
   if (!response.ok) throw new Error('Failed to delete project');
 }
+export async function setupConversation(projectId) {
+  const response = await fetch(`${API_URL}/projects/${projectId}/setup-conversation`, { method: 'POST' });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || 'Failed to create the Setup & Test conversation');
+  return data;
+}
+
+export async function resetBaseImage(projectId) {
+  const response = await fetch(`${API_URL}/projects/${projectId}/container/reset`, { method: 'POST' });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || 'Failed to reset the base image');
+  return data;
+}

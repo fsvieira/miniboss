@@ -5,7 +5,7 @@ import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { IconButton, Box, Typography } from '@mui/material';
-import { ContentCopy, Check } from '@mui/icons-material';
+import { ContentCopy, Check, PlayArrow } from '@mui/icons-material';
 import StreamingIndicator from './StreamingIndicator';
 import ToolIndicator, { ToolExecution } from './ToolIndicator';
 import chatStore from '../stores/chatStore';
@@ -276,7 +276,7 @@ function ErrorMessage({ message }) {
   );
 }
 
-function Message({ message, isUser, activeToolIndicators = [], isFocusView = false, currentFocusId = null }) {
+function Message({ message, isUser, activeToolIndicators = [], isFocusView = false, currentFocusId = null, currentConversationId = null, onExecuteText = null }) {
   // If it's an error message, use the ErrorMessage component
   if (isErrorMessage(message)) {
     return <ErrorMessage message={message} />;
@@ -340,12 +340,28 @@ function Message({ message, isUser, activeToolIndicators = [], isFocusView = fal
   }
 
   const [copied, setCopied] = useState(false);
+  const [executing, setExecuting] = useState(false);
   const content = message.error_message || message.content || '';
 
   const handleCopy = async () => {
     await navigator.clipboard.writeText(content);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
+  };
+
+  const handleExecute = async () => {
+    if (!onExecuteText || !content.trim()) return;
+    const conversationId = message.conversation_id || currentConversationId;
+    if (!conversationId) return;
+    setExecuting(true);
+    try {
+      await onExecuteText(conversationId, content);
+    } catch (error) {
+      console.error('Execute text error:', error);
+      alert(`Could not start execution: ${error.message}`);
+    } finally {
+      setExecuting(false);
+    }
   };
 
   return (
@@ -364,19 +380,26 @@ function Message({ message, isUser, activeToolIndicators = [], isFocusView = fal
         position: 'relative'
       }}>
         {!isUser && (
-          <IconButton
-            onClick={handleCopy}
-            size="small"
-            sx={{
-              position: 'absolute',
-              top: 4,
-              right: 4,
-              color: '#666',
-              '&:hover': { color: '#333' }
-            }}
-          >
-            {copied ? <Check fontSize="small" /> : <ContentCopy fontSize="small" />}
-          </IconButton>
+          <Box sx={{ position: 'absolute', top: 4, right: 4, display: 'flex', gap: 0.5 }}>
+            {onExecuteText && (
+              <IconButton
+                onClick={handleExecute}
+                size="small"
+                disabled={executing || !content.trim()}
+                title="Start execution from this message"
+                sx={{ color: '#666', '&:hover': { color: '#333' } }}
+              >
+                <PlayArrow fontSize="small" />
+              </IconButton>
+            )}
+            <IconButton
+              onClick={handleCopy}
+              size="small"
+              sx={{ color: '#666', '&:hover': { color: '#333' } }}
+            >
+              {copied ? <Check fontSize="small" /> : <ContentCopy fontSize="small" />}
+            </IconButton>
+          </Box>
         )}
         <MessageContent message={message} />
         <div style={{
@@ -392,7 +415,7 @@ function Message({ message, isUser, activeToolIndicators = [], isFocusView = fal
   );
 }
 
-const MessageList = observer(function MessageList({ messages, isLoading, streamingMessage, toolIndicators, isFocusView = false, currentFocusId = null }) {
+const MessageList = observer(function MessageList({ messages, isLoading, streamingMessage, toolIndicators, isFocusView = false, currentFocusId = null, currentConversationId = null, onExecuteText = null }) {
   const bottomRef = useRef(null);
 
   useEffect(() => {
@@ -416,6 +439,8 @@ const MessageList = observer(function MessageList({ messages, isLoading, streami
           activeToolIndicators={toolIndicators}
           isFocusView={isFocusView}
           currentFocusId={currentFocusId}
+          currentConversationId={currentConversationId}
+          onExecuteText={onExecuteText}
         />
       ))}
 

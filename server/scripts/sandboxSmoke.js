@@ -4,9 +4,8 @@
 /**
  * Live sandbox smoke test (Podman).
  *
- * Creates a throw-away repository + worktree with a `.miniboss/setup.sh`, runs a
- * few commands through the sandbox and asserts the guarantees the sandbox is
- * supposed to provide.
+ * Creates a throw-away repository + worktree, runs a few commands through the
+ * sandbox and asserts the guarantees the sandbox is supposed to provide.
  *
  * Usage:
  *   node server/scripts/sandboxSmoke.js
@@ -21,9 +20,6 @@ const { execFileSync } = require('child_process');
 
 const { runPodmanCommand, stopIdleContainers, removeContainerForConversation } = require('../services/sandbox/podmanExecutor');
 const { getSandboxConfig, resolvePodmanBinary, buildPodmanEnv } = require('../services/sandbox/runtime');
-
-/** Root of the MiniBoss repository (the repository setup script under test). */
-const MINIBOSS_ROOT = path.resolve(__dirname, '..', '..');
 
 const CONVERSATION_ID = `smoke-${process.pid}`;
 const ROOT = path.join(os.tmpdir(), `miniboss-sandbox-smoke-${process.pid}`);
@@ -74,52 +70,6 @@ async function main() {
   execFileSync('git', ['add', '.'], { cwd: repoRoot, stdio: 'ignore' });
   execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repoRoot, stdio: 'ignore' });
 
-  // The repository setup script is the REAL one of this repository: the test
-  // proves the split between the global script (generic toolbox) and the
-  // repository script (project-specific tools).
-  //
-  // Two probes are injected around it:
-  //   - `setup-runs.log`  → the script marks itself as executed (runs once);
-  //   - `tool-before`     → what the generic toolbox had installed *before*
-  //                         the repository script ran (must NOT contain the
-  //                         project-specific tools).
-  const setupDir = path.join(worktreePath, '.miniboss');
-  fs.mkdirSync(setupDir, { recursive: true });
-  const repositorySetup = path.join(MINIBOSS_ROOT, '.miniboss', 'setup.sh');
-  const setupBody = fs.existsSync(repositorySetup)
-    ? fs.readFileSync(repositorySetup, 'utf8')
-    : [
-        '#!/bin/sh',
-        'set -e',
-        'export DEBIAN_FRONTEND=noninteractive',
-        'apt-get update -qq',
-        'apt-get install -y -qq --no-install-recommends sqlite3',
-        'rm -rf /var/lib/apt/lists/*',
-        '',
-      ].join('\n');
-  const setupScript = setupBody.replace(
-    /^#!.*\n/,
-    [
-      '#!/usr/bin/env bash',
-      'set -euo pipefail',
-      'echo "setup ran at $(date +%s)" >> /home/miniboss/setup-runs.log',
-      'echo "setup-ok" > /home/miniboss/setup-marker',
-      'echo "before=$(command -v sqlite3 || echo missing)" > /home/miniboss/tool-before',
-      'mkdir -p /home/miniboss/.cache',
-      'echo "cache-warm" > /home/miniboss/.cache/miniboss-smoke-cache',
-      'echo "SETUP COMPLETED"',
-      '',
-    ].join('\n')
-  );
-  // Non-executable on purpose: the runner must honor the bash shebang instead
-  // of forcing `sh` (which rejects `set -o pipefail`).
-  fs.writeFileSync(path.join(setupDir, 'setup.sh'), setupScript, { mode: 0o644 });
-
-  // A shim created by the host (not by the root setup) to prove the worktree
-  // `.miniboss/bin` is on PATH without leaving subuid-owned files behind.
-  fs.mkdirSync(path.join(setupDir, 'bin'), { recursive: true });
-  fs.writeFileSync(path.join(setupDir, 'bin', 'smoke-tool'), '#!/bin/sh\necho smoke-tool\n', { mode: 0o755 });
-
   const baseOpts = {
     repoRoot,
     worktreePath,
@@ -134,15 +84,10 @@ async function main() {
     const hello = await runPodmanCommand('echo hello-from-sandbox', worktreePath, 30000, baseOpts);
     assert('the command runs inside the container', hello.stdout.includes('hello-from-sandbox'), hello.stderr);
     assert('the command exits with 0', hello.exitCode === 0, `exit=${hello.exitCode} ${hello.stderr}`);
-    assert(
-      'the bash setup script ran successfully',
-      hello.setup && hello.setup.status === 'ok',
-      `setup=${JSON.stringify(hello.setup)}`
-    );
 
-    // ── 2. The setup script ran ───────────────────────────────────────────
-    const setupLog = await runPodmanCommand('cat /home/miniboss/setup-marker 2>/dev/null || echo missing', worktreePath, 30000, baseOpts);
-    assert('the setup script ran inside the container', setupLog.stdout.includes('setup-ok'), setupLog.stdout);
+    // ── 2. Commands run as root inside the container ──────────────────────
+    const uid = await runPodmanCommand('id -u', worktreePath, 30000, baseOpts);
+    assert('the command runs as container root', String(uid.stdout || '').trim() === '0', `uid=${uid.stdout}`);
 
     // ── 3. The worktree is writable from the host after a container write ──
     await runPodmanCommand('echo written-by-container > written.txt', worktreePath, 30000, baseOpts);
@@ -183,17 +128,12 @@ async function main() {
     const tmp = await runPodmanCommand('touch /tmp/miniboss-smoke && echo tmp-ok', worktreePath, 30000, baseOpts);
     assert('/tmp is writable inside the container', tmp.stdout.includes('tmp-ok'), tmp.stderr);
 
-    // ── 7. The setup script runs only once across a stop/restart ──────────
-    const runsBefore = await runPodmanCommand('wc -l < /home/miniboss/setup-runs.log', worktreePath, 30000, baseOpts);
+    // ── 7. The global setup marker survives a stop/restart ────────────────
     stopIdleContainers(0);
     const afterStop = await runPodmanCommand('echo after-restart', worktreePath, 30000, baseOpts);
     assert('the container restarts after an idle stop', afterStop.exitCode === 0, afterStop.stderr);
-    const runsAfter = await runPodmanCommand('wc -l < /home/miniboss/setup-runs.log', worktreePath, 30000, baseOpts);
-    assert(
-      'the setup script did not run again after the restart',
-      runsBefore.stdout.trim() === runsAfter.stdout.trim(),
-      `before=${runsBefore.stdout.trim()} after=${runsAfter.stdout.trim()}`
-    );
+    const globalMarker = await runPodmanCommand('test -f /var/lib/miniboss/global-setup.done && echo marker-ok', worktreePath, 30000, baseOpts);
+    assert('the global setup marker is present', globalMarker.stdout.includes('marker-ok'), globalMarker.stdout);
 
     // ── 8. The npm cache lives inside the container ────────────────────────
     const npmCache = await runPodmanCommand('npm config get cache', worktreePath, 30000, baseOpts);
@@ -259,30 +199,8 @@ async function main() {
       `missing: ${genericMissing.join(', ')}`
     );
 
-    // ── 13. The repository setup installed the project-specific tools ─────
-    const projectTool = await runPodmanCommand('command -v sqlite3', worktreePath, 30000, baseOpts);
-    assert(
-      'the repository setup installed sqlite3',
-      /\/sqlite3$/.test(String(projectTool.stdout || '').trim()),
-      `stdout=${projectTool.stdout} ${projectTool.stderr}`
-    );
-
-    const before = await runPodmanCommand('cat /home/miniboss/tool-before', worktreePath, 30000, baseOpts);
-    assert(
-      'the global setup did NOT install the project-specific tools',
-      before.stdout.trim() === 'before=missing',
-      `stdout=${before.stdout.trim()} (the global script must not provide sqlite3)`
-    );
-
-    // ── 14. The setup shims are reachable through PATH ────────────────────
-    const shim = await runPodmanCommand('command -v smoke-tool', worktreePath, 30000, baseOpts);
-    assert(
-      'a binary installed in .miniboss/bin is on PATH',
-      String(shim.stdout || '').trim().endsWith('/.miniboss/bin/smoke-tool'),
-      `stdout=${shim.stdout} ${shim.stderr}`
-    );
-
-    // ── 15. The cache survives container recreation ───────────────────────
+    // ── 13. The cache survives container recreation ───────────────────────
+    await runPodmanCommand('mkdir -p /home/miniboss/.cache && echo cache-warm > /home/miniboss/.cache/miniboss-smoke-cache', worktreePath, 30000, baseOpts);
     removeContainerForConversation(CONVERSATION_ID);
     const cached = await runPodmanCommand('cat /home/miniboss/.cache/miniboss-smoke-cache', worktreePath, 30000, baseOpts);
     assert(
@@ -291,46 +209,6 @@ async function main() {
       `stdout=${cached.stdout} ${cached.stderr}`
     );
 
-    // ── 16. A failing setup is recorded and not retried on every command ──
-    const failWorktree = path.join(ROOT, 'fail-worktree');
-    fs.mkdirSync(path.join(failWorktree, '.miniboss'), { recursive: true });
-    fs.writeFileSync(
-      path.join(failWorktree, '.miniboss', 'setup.sh'),
-      [
-        '#!/bin/sh',
-        'echo run >> /home/miniboss/fail-runs',
-        'echo "setup boom" >&2',
-        'exit 3',
-        '',
-      ].join('\n'),
-      { mode: 0o644 }
-    );
-    const failOpts = {
-      ...baseOpts,
-      worktreePath: failWorktree,
-      conversationId: `smoke-fail-${process.pid}`,
-    };
-    const failFirst = await runPodmanCommand('echo ok', failWorktree, 30000, failOpts);
-    assert(
-      'a failing setup is reported as setup.status = failed',
-      failFirst.setup && failFirst.setup.status === 'failed',
-      `setup=${JSON.stringify(failFirst.setup)}`
-    );
-    assert(
-      'the setup failure does not flood the command stderr',
-      !String(failFirst.stderr || '').includes('setup boom'),
-      `stderr=${failFirst.stderr}`
-    );
-    const failSecond = await runPodmanCommand('echo ok', failWorktree, 30000, failOpts);
-    assert('the command still runs after a failed setup', failSecond.exitCode === 0, failSecond.stderr);
-    const failRunsOutput = await runPodmanCommand('wc -l < /home/miniboss/fail-runs', failWorktree, 30000, failOpts);
-    const failRuns = parseInt(String(failRunsOutput.stdout || '').trim(), 10);
-    assert(
-      'a failed setup is not retried within the backoff window',
-      failRuns === 1,
-      `runs=${failRuns}`
-    );
-    removeContainerForConversation(`smoke-fail-${process.pid}`);
   } finally {
     try {
       removeContainerForConversation(CONVERSATION_ID);

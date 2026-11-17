@@ -43,39 +43,3 @@ export async function browseDirectory(path) {
   }
   return response.json();
 }
-
-export async function getProjectContainer(projectId) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/container`);
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || 'Failed to fetch the project container');
-  }
-  return response.json();
-}
-
-export async function startProjectContainer(projectId) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/container/start`, { method: 'POST' });
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || 'Failed to start the project container');
-  }
-  return response.json();
-}
-
-export async function saveProjectContainer(projectId) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/container/save`, { method: 'POST' });
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || 'Failed to save the project container');
-  }
-  return response.json();
-}
-
-export async function resetProjectContainer(projectId) {
-  const response = await fetch(`${API_URL}/projects/${projectId}/container/reset`, { method: 'POST' });
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || 'Failed to reset the project container');
-  }
-  return response.json();
-}

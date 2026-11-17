@@ -1,7 +1,7 @@
-import React, { useRef, useState, useEffect, useCallback } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import { observer } from 'mobx-react-lite';
-import { Box, IconButton, useTheme, useMediaQuery, Typography, Chip, Breadcrumbs, Link } from '@mui/material';
-import { Menu, MoreVert, ListAlt, ArrowBack, Lock, Checklist, Restore, Settings } from '@mui/icons-material';
+import { Box, Button, IconButton, useTheme, useMediaQuery, Typography, Chip, Breadcrumbs, Link } from '@mui/material';
+import { Menu, MoreVert, ArrowBack, Lock, Checklist, Restore, Save, Psychology } from '@mui/icons-material';
 
 import { clearConversationMessages, cancelConversationAI } from '../api/settings';
 import chatStore from '../stores/chatStore';
@@ -12,24 +12,24 @@ import MessageList from './MessageList';
 import MessageInput from './MessageInput';
 import ContextIndicator from './ContextIndicator';
 import ConversationModelModal from './ConversationModelModal';
-import TaskTreePanel from './TaskTreePanel';
 import PlanPanel from './PlanPanel';
-import { fetchTaskTree, getPlan, setConversationMode, setConversationModel, executePlan } from '../api/conversations';
+import { getPlan, setConversationMode, setConversationModel, executePlan, saveBaseImage } from '../api/conversations';
+import { resetBaseImage, setupConversation } from '../api/projects';
 import { getFocusConversations } from '../api/focus';
 import socketService from '../socketService';
 
 
-const Chat = observer(function Chat({ conversation, onConversationUpdated, onConversationDeleted, onToggleSidebar, onOpenConversation, onConversationsChanged }) {
+const Chat = observer(function Chat({ conversation, onConversationUpdated, onConversationDeleted, onToggleSidebar, onOpenConversation, onConversationsChanged, onExecuteText }) {
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('md'));
 
   const [modelModalOpen, setModelModalOpen] = useState(false);
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
-  const [taskTreeVisible, setTaskTreeVisible] = useState(true);
   const [planVisible, setPlanVisible] = useState(true);
-  const [taskTree, setTaskTree] = useState([]);
   const [plan, setPlan] = useState(null);
-  const [insertTaskText, setInsertTaskText] = useState('');
+  const insertTaskText = '';
+  const [baseImageBusy, setBaseImageBusy] = useState(false);
+  const [setupBusy, setSetupBusy] = useState(false);
   const summaryAbortRef = useRef(null);
 
   const effectiveConversationId = conversation?.id;
@@ -152,6 +152,7 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
   };
 
   const isProjectMemory = conversation?.conversation_type === 'project';
+  const isSetup = conversation?.conversation_type === 'setup';
 
   const handleExecutePlan = async () => {
     if (!effectiveConversationId || isBusy) return;
@@ -166,24 +167,26 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
     }
   };
 
+  const handleSetupTest = async () => {
+    const projectId = conversation?.project_id;
+    if (!projectId || setupBusy || isProcessing) return;
+    setSetupBusy(true);
+    try {
+      const conv = await setupConversation(projectId);
+      await onConversationsChanged?.();
+      onOpenConversation?.(conv);
+    } catch (error) {
+      console.error('Setup & Test error:', error);
+      alert(`Could not create the Setup & Test conversation: ${error.message}`);
+    } finally {
+      setSetupBusy(false);
+    }
+  };
+
   const handleWhereWasI = () => {
     handleSendMessage(
       'Do a recap of the project state: current focus, what was being done, recent decisions, discoveries, related ideas, ongoing executions and next steps.'
     );
-  };
-
-  const handleSetupProject = () => {
-    handleSendMessage(
-      'Act as project manager for the project associated with this conversation: analyze the project and produce a plan (via updatePlan) to create or update the .miniboss/setup.sh file in the project worktree. The script must install, as root, once inside the Podman container, everything needed to develop, test and run this project. Detect the project stack (package.json, Makefile, Dockerfile, etc.), identify required dependencies and tools, and generate an idempotent script (use command -v, set -e). Use runCommand only for inspection. Raise any requirements, potential problems, or open questions you foresee, and discuss viability with the user before finalizing. The plan should convey intentions, concepts and tips — not overly prescriptive steps; execution happens in a separate implementation conversation. Do not write files directly (Project Memory is read-only). Do not touch the repo-root.'
-    );
-  };
-
-  const loadTaskTree = async () => {
-    if (!effectiveConversationId) return;
-    try {
-      const tree = await fetchTaskTree(effectiveConversationId);
-      setTaskTree(tree);
-    } catch (_) {}
   };
 
   const loadPlan = async () => {
@@ -197,19 +200,8 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
   useEffect(() => {
     if (effectiveConversationId) {
       socketService.joinConversation(effectiveConversationId);
-      loadTaskTree();
       loadPlan();
     }
-    // Socket listener for live updates
-    const handler = (data) => {
-      if (data?.conversationId && String(data.conversationId) !== String(effectiveConversationId)) return;
-      if (data?.tree) {
-        setTaskTree(data.tree);
-      } else {
-        loadTaskTree();
-      }
-    };
-    socketService.on('taskTreeUpdated', handler);
 
     const planHandler = (data) => {
       if (data?.conversationId && String(data.conversationId) !== String(effectiveConversationId)) return;
@@ -221,16 +213,7 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
     };
     socketService.on('planUpdated', planHandler);
 
-    // Also listen to raw 'message' events for task tools
     const messageHandler = (msg) => {
-      if (msg?.role === 'tool' && ['addTodo', 'updateTodo', 'removeTodo'].includes(msg.tool_name)) {
-        try {
-          const p = JSON.parse(msg.tool_result || msg.content || '{}');
-          if (p.task_updated) loadTaskTree();
-        } catch {
-          loadTaskTree();
-        }
-      }
       if (msg?.role === 'tool' && msg.tool_name === 'updatePlan') {
         loadPlan();
       }
@@ -238,32 +221,10 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
     socketService.on('message', messageHandler);
 
     return () => {
-      socketService.off('taskTreeUpdated', handler);
       socketService.off('planUpdated', planHandler);
       socketService.off('message', messageHandler);
     };
   }, [effectiveConversationId]);
-
-  // Reliable task tree refresh
-  useEffect(() => {
-    if (!messages.length) return;
-
-    const recent = messages.slice(-3);
-    const hasTaskUpdate = recent.some(msg => {
-      if (msg.role !== 'tool') return false;
-      if (!['addTodo', 'updateTodo', 'removeTodo'].includes(msg.tool_name)) return false;
-      try {
-        const p = JSON.parse(msg.tool_result || msg.content || '{}');
-        return !!p.task_updated;
-      } catch {
-        return true;
-      }
-    });
-
-    if (hasTaskUpdate) {
-      loadTaskTree();
-    }
-  }, [messages]);
 
   const handleStop = async () => {
     if (!effectiveConversationId) return;
@@ -279,6 +240,36 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
   };
 
   const handleSettingsOpen = () => setSettingsPanelOpen(true);
+
+  const handleSaveBaseImage = async () => {
+    if (!effectiveConversationId || isProcessing) return;
+    setBaseImageBusy(true);
+    try {
+      await saveBaseImage(effectiveConversationId);
+      alert('Base image saved. New executions of this project use it; the project memory container is recreated on the next command.');
+    } catch (error) {
+      console.error('Save base image error:', error);
+      alert(`Could not save the base image: ${error.message}`);
+    } finally {
+      setBaseImageBusy(false);
+    }
+  };
+
+  const handleResetBaseImage = async () => {
+    const projectId = conversation?.project_id;
+    if (!projectId || isProcessing) return;
+    if (!confirm('Reset the project base image to the default sandbox image?')) return;
+    setBaseImageBusy(true);
+    try {
+      await resetBaseImage(projectId);
+      alert('Base image reset to the default sandbox image.');
+    } catch (error) {
+      console.error('Reset base image error:', error);
+      alert(`Could not reset the base image: ${error.message}`);
+    } finally {
+      setBaseImageBusy(false);
+    }
+  };
 
   const activeContextInfo = isFocusMode ? focusState?.contextInfo : contextInfo;
   const contextBusy = isFocusMode ? focusState?.isLoading : isBusy;
@@ -372,6 +363,9 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
                 {conversation?.conversation_type === 'main' && (
                   <Chip label="MAIN" size="small" color="primary" variant="outlined" sx={{ fontSize: '0.65rem', height: 20 }} />
                 )}
+                {isSetup && (
+                  <Chip label="Setup & Test" size="small" color="success" variant="outlined" sx={{ fontSize: '0.65rem', height: 20 }} />
+                )}
                 {conversation?.conversation_type === 'main' && (
                   <Chip
                     label={conversation?.mode === 'exec' ? 'Exec Mode' : 'Plan Mode'}
@@ -407,13 +401,14 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
           )}
           {isProjectMemory && (
             <Chip
-              icon={<Settings fontSize="small" />}
-              label="Setup Project"
+              icon={<Psychology fontSize="small" />}
+              label="Setup & Test"
               size="small"
-              color="primary"
+              color="success"
               variant="outlined"
-              onClick={handleSetupProject}
+              onClick={handleSetupTest}
               clickable
+              disabled={setupBusy || isProcessing}
               sx={{ fontSize: '0.7rem', height: 24, cursor: 'pointer' }}
             />
           )}
@@ -427,10 +422,33 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
           {showRetryChip && (
             <Chip label="Retrying…" size="small" color="warning" sx={{ fontSize: '0.7rem', height: 20 }} />
           )}
+          {isSetup && (
+            <>
+              <Button
+                size="small"
+                variant="outlined"
+                color="success"
+                startIcon={<Save fontSize="small" />}
+                onClick={handleSaveBaseImage}
+                disabled={baseImageBusy || isProcessing}
+                sx={{ fontSize: '0.7rem' }}
+              >
+                Guardar como imagem base
+              </Button>
+              <Button
+                size="small"
+                variant="outlined"
+                color="warning"
+                startIcon={<Restore fontSize="small" />}
+                onClick={handleResetBaseImage}
+                disabled={baseImageBusy || isProcessing}
+                sx={{ fontSize: '0.7rem' }}
+              >
+                Repor imagem base
+              </Button>
+            </>
+          )}
         </Box>
-        <IconButton onClick={() => setTaskTreeVisible(v => !v)} title="Toggle Task Tree">
-          <ListAlt />
-        </IconButton>
         <IconButton onClick={() => setPlanVisible(v => !v)} title="Toggle Plan">
           <Checklist />
         </IconButton>
@@ -451,7 +469,7 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
         hideClear={isFocusMode}
       />
 
-      {/* Chat area + optional Task Tree panel */}
+      {/* Chat area + optional plan panel */}
       <Box sx={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         {isFocusMode && focusState ? (
           /* Focus mode: show focus messages + sub-focuses footer */
@@ -469,6 +487,8 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
                   toolIndicators={focusState.toolIndicators}
                   isFocusView={true}
                   currentFocusId={currentFocusView?.id || null}
+                  currentConversationId={currentFocusView?.id || null}
+                  onExecuteText={onExecuteText}
                 />
               )}
             </Box>
@@ -523,6 +543,8 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
               isLoading={isLoading}
               streamingMessage={streamingMessage}
               toolIndicators={toolIndicators}
+              currentConversationId={effectiveConversationId}
+              onExecuteText={onExecuteText}
             />
             <MessageInput
               onSend={handleSendMessage}
@@ -553,17 +575,8 @@ const Chat = observer(function Chat({ conversation, onConversationUpdated, onCon
             )}
           </Box>
         )}
-        {/* Only show TaskTreePanel when NOT in focus view and NOT in project memory */}
-        {!chatStore.isFocusView && !isProjectMemory && (
-          <TaskTreePanel
-            tasks={taskTree}
-            visible={taskTreeVisible}
-            onInsertId={(text) => setInsertTaskText(text)}
-          />
-        )}
-
         {/* Plan panel — sticky: MAIN (plan/exec) e Project Memory (com Executar) */}
-        {!chatStore.isFocusView && (conversation?.conversation_type === 'main' || isProjectMemory) && (
+        {!chatStore.isFocusView && (conversation?.conversation_type === 'main' || conversation?.conversation_type === 'setup' || isProjectMemory) && (
           <PlanPanel
             plan={plan}
             visible={planVisible}

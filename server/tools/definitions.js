@@ -433,30 +433,10 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
     }
   ];
 
-  if (conversationId) {
-    const { createTaskTreeTools } = require('./taskTreeTools');
-    const taskTools = createTaskTreeTools(conversationId);
-    // Add task tree tools definitions only for MAIN
-    if (conversationType === 'main') {
-      Object.values(taskTools).forEach(tool => {
-        tools.push({
-          type: 'function',
-          function: {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters
-          }
-        });
-      });
-    }
-  }
-
   // Add focus tools based on conversation type
   if (conversationId && conversationType) {
     const { createFocusTools } = require('./focusTools');
     const focusTools = createFocusTools(conversationId);
-    const { createTaskTreeTools } = require('./taskTreeTools');
-    const taskTools = createTaskTreeTools(conversationId);
 
     // Enforce plan mode read-only filtering for ALL conversation types that support mode switching.
     // This removes write tools from the exposed tool list when conversationMode === 'plan'.
@@ -496,8 +476,9 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
       }
     }
 
-    // MAIN conversations get ALL tools + investigate + TODO/task tree tools + plan tools
-    if (conversationType === 'main') {
+    // MAIN and SETUP conversations get ALL tools + investigate + plan tools.
+    // SETUP has the same toolset as MAIN so it can install packages and run tests.
+    if (conversationType === 'main' || conversationType === 'setup') {
       const { createPlanTools } = require('./planTools');
       const planTools = createPlanTools(conversationId);
       for (const name of ['updatePlan', 'getPlan']) {
@@ -523,7 +504,7 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
     }
 
     // FOCUS conversations (investigation subbot): read-only tools + runCommand +
-    // investigate (can create sub-investigations) + submitFindings + task tree tools
+    // investigate (can create sub-investigations) + submitFindings + getPlan
     if (conversationType === 'focus') {
       for (let i = tools.length - 1; i >= 0; i--) {
         if (!READ_ONLY_TOOLS.includes(tools[i].function.name)) {
@@ -563,17 +544,6 @@ function createTools(workingDir, conversationId = null, conversationType = 'chat
           description: focusTools.submitFindings.description,
           parameters: focusTools.submitFindings.parameters
         }
-      });
-      // Add task tree tools
-      Object.values(taskTools).forEach(tool => {
-        tools.push({
-          type: 'function',
-          function: {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters
-          }
-        });
       });
 
       // Add getPlan (read-only) — o subbot pode consultar o plano da conversa pai

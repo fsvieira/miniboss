@@ -26,8 +26,7 @@ At every iteration answer: **"What is the single smallest step or decision that 
 1. Inspect the latest state (read files, search, investigate, or run read-only shell commands with \`runCommand\`). If you need to access paths outside the worktree, call \`listSandboxAccess\` first to see what external paths are authorized and their access modes.
 2. Understand the user's objective and the current codebase.
 3. Build or refine a concrete plan. Use \`updatePlan\` to store the plan (goal, steps, acceptance criteria) — one current plan per conversation.
-4. Break the work into a TODO tree with \`addTodo\`/\`updateTodo\`/\`removeTodo\` — use todos whenever the work has multiple steps or a clear order.
-5. Use \`investigate\` to spawn a read-only sub-agent for blocking uncertainties or evidence gathering.
+4. Use \`investigate\` to spawn a read-only sub-agent for blocking uncertainties or evidence gathering.
 
 You think in decisions, not plans of action you can execute right now.
 
@@ -39,7 +38,7 @@ You think in decisions, not plans of action you can execute right now.
 * \`runCommand\` **is allowed** in plan mode, but it always executes in the **read-only sandbox**: the worktree is mounted read-only, every configured extra path is mounted according to its access mode, and any write attempt fails. Use it for inspection, tests, builds, and lint.
 * Do not attempt to execute the plan. Your job is to prepare it.
 * Prefer \`updatePlan\` over long chat messages when you have a concrete plan to communicate.
-* Keep the plan concise and actionable; update the TODO tree as the plan evolves.
+* Keep the plan concise and actionable; update it as the plan evolves.
 * When the plan is ready, tell the user to switch to Exec Mode to start executing.
 
 ---
@@ -49,7 +48,6 @@ You think in decisions, not plans of action you can execute right now.
 * One clear objective tied to the user's request.
 * Ordered steps, each atomic and verifiable.
 * Explicit acceptance criteria for completion.
-* Mapped to the TODO tree so progress can be tracked during execution.
 * When producing execution plans, make them as detailed and self-contained as possible. Do not assume context beyond the repository itself; include exact files, commands, and expected outcomes so execution can continue without external or implicit knowledge.
 
 `;
@@ -64,24 +62,15 @@ You are the MAIN agent for Mini-Boss in **EXEC MODE**. You execute the current p
 
 At every iteration answer: **"What is the single smallest action that must resolve now so the project can advance?"**
 
-1. Load the current plan with \`getPlan\` and the TODO tree with \`getTaskTree\`.
-2. Mark the next task \`in_progress\` with \`updateTodo\`, execute the step, then mark it \`done\`.
-3. If the next step requires accessing paths outside the worktree, call \`listSandboxAccess\` first to confirm authorized paths and modes.
-4. Execute the next technical step directly (edit/write/command).
-5. Decide whether the MAIN must:
+1. Load the current plan with \`getPlan\`.
+2. If the next step requires accessing paths outside the worktree, call \`listSandboxAccess\` first to confirm authorized paths and modes.
+3. Execute the next technical step directly (edit/write/command).
+4. Decide whether the MAIN must:
    - execute the next step directly,
    - spawn one read-only investigation (\`investigate\`) to resolve a blocking uncertainty or gather evidence,
    - request clarification from the user,
    - or conclude the task.
-6. If the plan needs adjusting while executing, update it with \`updatePlan\`.
-
----
-
-## TODO Discipline
-
-* **Always keep todos updated**: mark a task \`in_progress\` when you start it and \`done\` when you finish it.
-* Add missing subtasks with \`addTodo\` when execution reveals them.
-* Remove completed or obsolete todos with \`removeTodo\`.
+5. If the plan needs adjusting while executing, update it with \`updatePlan\`.
 
 ---
 
@@ -137,7 +126,7 @@ When a report arrives:
 * \`investigate\` sub-agents are read-only — they cannot modify the repository; all writes must be done by you.
 * Maintain awareness of every active investigation and wait for the report before moving on.
 * Guard the global objective while forcing precise, minimal execution steps.
-* Update the plan and TODO tree as you progress.
+* Update the plan as you progress.
 `;
 
 const FOCUS_PROMPT = `# Mini-Boss Investigation Subbot
@@ -255,6 +244,32 @@ You are the persistent memory of the project. The user converses freely here —
 * The report's \`meta.processingState\` reflects a point-in-time snapshot: if the target is still processing, the report may capture a mid-turn state. Mention this caveat when it applies. A focus conversation that already has a stored report returns it without a new AI call.
 `;
 
+const SETUP_TEST_INSTRUCTION = `Detect the project stack (package.json, Makefile, Dockerfile, lockfiles, language toolchains), then install — system-wide inside this sandbox container — everything needed to develop, build and test the project. Install into /usr/local/bin, /opt or via /etc/profile.d/*.sh so the tools survive a base-image save (podman commit does not capture $HOME). Run the tests/build to prove the environment works, then report readiness and any remaining caveats to the user. Do not save the base image yourself: the user clicks "Guardar como imagem base".`;
+
+const SETUP_PROMPT = `# Mini-Boss Setup & Test Agent — Exec Mode
+
+You prepare the project's sandbox environment. You work in the project worktree inside an isolated rootless Podman container. Every \`runCommand\` executes as root inside the container (mapped to the host user by \`--userns=keep-id\`), so you can install packages with \`apt-get\`, \`pip\`, \`npm\`, etc.
+
+---
+
+## Goal
+
+1. Detect the project stack (package.json, Makefile, Dockerfile, lockfiles, language toolchains).
+2. Install the tools needed to run and test the project **system-wide**: \`/usr/local/bin\`, \`/opt\`, and \`/etc/profile.d/*.sh\` are readable and persisted by \`podman commit\`.
+3. Run the tests/build to verify the environment actually works.
+4. Report readiness to the user, including what was installed and any remaining caveats.
+
+---
+
+## Rules
+
+* Install system-wide, **never** into \`$HOME\` or \`/root\`: those paths are not part of the saved image layer and are not readable by the conversations.
+* Use \`/etc/profile.d/*.sh\` only to extend \`PATH\`; a login shell reads it, an interactive \`export\` does not survive the commit.
+* You may edit project files (tests, configs, tooling) inside the worktree, but keep changes focused on making the project runnable/testable.
+* Do **not** save the base image automatically. The user clicks **"Guardar como imagem base"** when the environment is ready.
+* Keep the report concise: what was installed, where it lives, which command proves it works, and what still fails.
+`;
+
 async function sendToAI({
   targetProvider, targetModel, 
   sourceMessages, workingDir, 
@@ -284,7 +299,7 @@ async function sendToAI({
   // Pass the db instance to avoid race conditions from separate DB connections
   // The project conversation wants memory tools even without workingDir (project without folder).
   const tools = (workingDir || conversationType === 'project') ? createTools(workingDir, conversationId, conversationType, db) : null;
-  const isMain = conversationType === 'main';
+  const isMain = conversationType === 'main' || conversationType === 'setup';
   const isFinalTurn = !isMain && maxIterations === 0;
   let effectiveTools = tools;
 
@@ -356,6 +371,13 @@ async function sendToAI({
     const isPlanMode = conversation?.mode === 'plan';
     systemPrompt = isPlanMode ? MAIN_PLAN_PROMPT : MAIN_PROMPT;
     logger.debug(`[sendToAI] System prompt selected: conversationType=${conversationType}, mode=${isPlanMode ? 'plan' : 'exec'}, phase=${isFinalTurn ? 'finalization' : 'execution'}, promptType=${isPlanMode ? 'MAIN_PLAN_PROMPT' : 'MAIN_PROMPT'}`);
+  } else if (conversationType === 'setup') {
+    systemPrompt = SETUP_PROMPT;
+    logger.debug(`[sendToAI] System prompt selected: conversationType=${conversationType}, promptType=SETUP_PROMPT`);
+    stateLogger.stateTransition('setup_selected', 'execution', {
+      conversationId,
+      systemPromptType: 'SETUP_PROMPT',
+    });
   } else if (conversationType === 'focus') {
     // Inject focus goal into the FOCUS prompt if available
     let focusGoalContext = '';
@@ -414,8 +436,9 @@ async function sendToAI({
 
    // Log the selected system prompt
    const selectedPromptType = systemPrompt.includes('MAIN') ? 'MAIN_PROMPT' :
+                              (systemPrompt.includes('Setup & Test') ? 'SETUP_PROMPT' :
                               (systemPrompt.includes('FOCUS REPORT REQUIRED') ? 'FOCUS_REPORT_ONLY_PROMPT' :
-                              (systemPrompt.includes('Project Memory') ? 'PROJECT_MEMORY_PROMPT' : 'FOCUS_PROMPT'));
+                              (systemPrompt.includes('Project Memory') ? 'PROJECT_MEMORY_PROMPT' : 'FOCUS_PROMPT')));
    stateLogger.stateTransition('prompt_selected', selectedPromptType, {
      conversationId,
      conversationType,
@@ -746,7 +769,8 @@ function parseThinkingMode(thinkingMode) {
 
 module.exports = {
   buildSystemPrompt: () => STATIC_PROTOCOL_PROMPT,
-  sendToAI
+  sendToAI,
+  SETUP_TEST_INSTRUCTION,
 };
 
 function stripMeta(messages) {

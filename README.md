@@ -12,7 +12,7 @@ MiniBoss uses Git worktrees together with a **rootless Podman** sandbox to limit
 
 - The assistant operates inside the active worktree. The worktree is bind-mounted inside an isolated container at the same absolute path, so nothing is written outside it from within an execution conversation.
 - The base repository is mounted **read-only**; it is only modified through explicit Git operations that you initiate in the Git section.
-- The container runs with `--userns=keep-id` (so the files it writes stay owned by your user), `--cap-drop=ALL` and `no-new-privileges`.
+- The container runs with `--userns=keep-id:uid=0,gid=0` (the container root is mapped to your host user, so the files it writes stay owned by you), `--cap-drop=ALL` and `no-new-privileges`. Commands execute as **root inside the isolated container**, so the assistant can install packages (`apt-get`, `pip`) without gaining host access.
 - The container receives an **explicit environment allowlist** (`HOME`, `PATH`, `LANG`, `TZ`, `CI`) — the host environment is never leaked into the command.
 - One container is kept per conversation worktree, so the npm cache and the project setup survive between commands. Idle containers are stopped (not deleted) and removed when the conversation is deleted.
 - The **output of a command is transported through files**: the command writes its stdout, stderr and exit code into a scratch directory that is bind-mounted read-write in the container, and the server reads the files back. The stream of `podman exec` is only a fallback — it intermittently comes back empty, which used to leave the assistant without any output.
@@ -40,7 +40,6 @@ The sandbox is currently **Linux-only** and requires rootless Podman (`podman`) 
 | `SANDBOX_IO_MOUNT_TARGET` | `/var/lib/miniboss/io` | Mount point of the output exchange inside the container |
 | `SANDBOX_GLOBAL_SETUP` | `1` | Runs the global setup script once per container (`0` disables it) |
 | `SANDBOX_GLOBAL_SETUP_SCRIPT` | `<data>/sandbox/setup.sh` | Global setup script (generic CLI tools missing from the image) |
-| `SANDBOX_SETUP_SCRIPT` | `.miniboss/setup.sh` | Repository setup script, relative to the conversation worktree |
 | `PODMAN_BIN` | auto-detected | Path to the `podman` binary |
 
 ### The stack limit
@@ -51,16 +50,18 @@ The container starts with an 8 MB stack, which is too small for deep recursion a
 
 The image `node:22-bookworm` does not ship the CLI tools the assistant often needs. On startup MiniBoss writes a default script to `SANDBOX_GLOBAL_SETUP_SCRIPT` when it does not exist yet — edit it to install something else. The script runs **once per container, as root** (it adds ~20-40 s to the first command of each conversation); a failure is not fatal and the container keeps working. Set `SANDBOX_GLOBAL_SETUP=0` to disable it.
 
-The global script holds the **generic** toolbox only — the tools useful in any project (`jq`, `ripgrep`, `iproute2`). Anything project-specific belongs in the **repository** setup script:
+The global script holds the **generic** toolbox only — the tools useful in any project (`jq`, `ripgrep`, `iproute2`). Project-specific tools are **not** installed from a repository script anymore: they belong to the project's **base image**, built in a **Setup & Test** conversation.
 
-| | Global | Repository |
-|---|---|---|
-| Path | `<data>/sandbox/setup.sh` | `<worktree>/.miniboss/setup.sh` |
-| Scope | every project | only the project that owns the worktree |
-| Contents | generic tools | project-specific tools (e.g. `sqlite3` for the MiniBoss `chat.db`) |
-| Order | first | right after the global one |
+### Project base image
 
-The repository script is looked up **inside the conversation worktree**, so a `.miniboss/setup.sh` committed to the project repository travels with it automatically (the worktree is a git worktree of that repository). It must be committed — a file that only exists in the working copy of the main checkout is not present in the worktree. `SANDBOX_SETUP_SCRIPT` changes the relative path (e.g. `scripts/sandbox-setup.sh`).
+Each project can have its own base image with the tools it needs (a database CLI, a linter, a language toolchain). To build it:
+
+1. Open the project and press **Setup & Test**. This creates an execution conversation with the setup instructions.
+2. The assistant detects the stack, installs the tools **system-wide** (`/usr/local/bin`, `/opt`, `/etc/profile.d/*.sh`) and runs the tests/build.
+3. When the environment is ready, press **"Guardar como imagem base"**. MiniBoss commits the running container into `localhost/miniboss/proj-<id>:<timestamp>` and stores it in the project. New conversations use that image; existing containers are recreated on their next command.
+4. **"Repor imagem base"** clears the saved image and falls back to `SANDBOX_IMAGE`.
+
+`podman commit` only captures the image layer (installed tools and profile scripts), never the bind-mounted worktree or cache. Installing into `$HOME`/`/root` does not persist — install system-wide.
 
 ### Installing Podman without root
 
@@ -76,8 +77,8 @@ cp -r podman-linux-amd64/usr podman-linux-amd64/etc ~/
 Then point `~/.config/containers/containers.conf` at the helper binaries
 (`conmon`, `crun`, `netavark`) and expose a `podman` wrapper in `~/.local/bin`.
 Without the `uidmap` package (`newuidmap`/`newgidmap`) the container can only
-map a single UID — enough for the sandbox, since `--userns=keep-id` maps the
-container root to the host user, but the full sub-UID range is preferable:
+map a single UID — enough for the sandbox, since `--userns=keep-id:uid=0,gid=0`
+maps the container root to the host user, but the full sub-UID range is preferable:
 
 ```bash
 sudo apt-get install -y podman uidmap
@@ -103,9 +104,6 @@ sudo apt-get install -y podman uidmap
 
 ![Project Memory + plan / execute](./docs/screenshots/project-memory-plan-execute.png)
 *Persistent project memory alongside plan and execute workflows.*
-
-![Execution conversation with TODO + plan](./docs/screenshots/execution-conversation-todo-plan.png)
-*Focused execution session with TODO list and embedded plan.*
 
 ![Execution conversation + Git](./docs/screenshots/execution-conversation-git.png)
 *Reviewing code changes, commit, and merge inside an execution conversation.*
